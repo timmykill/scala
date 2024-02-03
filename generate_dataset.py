@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 
-num_users = 20
-num_items = 7
+num_users = 200
+num_items = 89
 
 std_dev = 2
 size = 1000
@@ -26,7 +26,7 @@ for user_id in range(num_users):
     data = np.round(data, 2)
 
     for item_id in range(num_items):
-        df.iloc[user_id, item_id] = data[item_id] or 1
+        df.iloc[user_id, item_id] = data[item_id] if item_id < len(data) else 1
 
 # print the dataframe
 df.index.name = 'User_ID'
