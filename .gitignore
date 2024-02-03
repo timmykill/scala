@@ -8,7 +8,7 @@ src_managed/
 .bloop/
 .metals/
 
-.vscode
-.bsp
+.vscode/
+.bsp/
 
 dataset.txt
