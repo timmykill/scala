@@ -1,40 +1,64 @@
-// IMPLEMENTIAMO https://ethen8181.github.io/machine-learning/recsys/1_ALSWR.html
-
-import org.apache.spark.mllib.linalg.{Matrix, Matrices, DenseMatrix}
-import matrix.AAMatrix
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.types._
+import org.apache.spark.mllib.linalg.distributed.{CoordinateMatrix, MatrixEntry}
 
 
 
 object SimpleApp {
 	def main(args: Array[String]): Unit = {
+		val spark = SparkSession.builder()
+		  .appName("Create Ratings Matrix")
+		  .config("spark.master", "local")
+		  .getOrCreate()
+		spark.sparkContext.setLogLevel("ERROR")
 
-//		ESEMPIO CREAZIONE MATRICI
-//		// Create a dense matrix ((1.0, 2.0), (3.0, 4.0), (5.0, 6.0))
-//		val dm: Matrix = Matrices.dense(3, 2, Array(1.0, 3.0, 5.0, 2.0, 4.0, 6.0))
-//
-//		// Create a sparse matrix ((9.0, 0.0), (0.0, 8.0), (0.0, 6.0))
-//		val sm: Matrix = Matrices.sparse(3, 2, Array(0, 1, 3), Array(0, 2, 1), Array(9, 6, 8))
-
-		val test = scala.io.Source.fromFile("ml-100k/u.data").getLines.toArray.flatMap(_.split("\t")).map(_.toDouble)
 		// colonne: user_id item_id rating timestamp
-		//val m1 = new DenseMatrix(100000,4,test,true)
-		val m1 = AAMatrix(100000,4,test)
-		val n_unique_users = m1.rowIter.map(_(0)).distinct.length
-		val n_unique_items = m1.rowIter.map(_(1)).distinct.length
+		val customSchema = StructType(Array(
+		  StructField("user_id", IntegerType, true),
+		  StructField("item_id", IntegerType, true),
+		  StructField("rating", DoubleType, true),
+		  StructField("timestamp", LongType, true))
+		)
 
-		val ratings = AAMatrix.zeros(n_unique_users, n_unique_items)
+		// Read the CSV file into a DataFrame
+		val df = spark.read
+		  .option("header", "true")
+		  .schema(customSchema)
+		  .option("delimiter", "\t")
+		  .csv("ml-100k/u.data")
 
-		m1.rowIter.foreach(a => {
-			ratings.update(a(0).toInt -1, a(1).toInt -1, a(2));
-		})
+		df.show()
 
-		val matrix_size : Double = n_unique_users * n_unique_items
-		val interaction : Double = ratings.flatNonZero.length
-		val sparsity = 100 * (interaction / matrix_size)
+		val nUsers = df.select(countDistinct("user_id")).collect()(0)(0).asInstanceOf[Number].intValue()
+		val nItems = df.select(countDistinct("item_id")).collect()(0)(0).asInstanceOf[Number].intValue()
 
-		println(f"dimension: ${ratings.shape}")
+		//val bigArray = Array(nUsers * nItems)
+		//ratings.map(row => {
+		//	case (userId, itemId, rating, _) => {
+		//		bigArray(userId * nUsers + itemId) = rating}})
+
+		val entries = df.rdd.map(row => {
+			val userId = row.getAs[Int]("user_id")
+			val itemId = row.getAs[Int]("item_id")
+			val rating = row.getAs[Double]("rating")
+			MatrixEntry(userId - 1, itemId - 1, rating)})
+
+		val coordMatrix = new CoordinateMatrix(entries)
+		val matrix_size : Double = coordMatrix.numRows() * coordMatrix.numCols()
+		println(f"rows: ${coordMatrix.numRows()}")
+		println(f"cols: ${coordMatrix.numCols()}")
+		val interactions = entries.count()
+		println(f"interactions: ${interactions}")
+		val sparsity = 100 * (interactions / matrix_size)
+
+		println(f"dimension: ${matrix_size}")
 		println(f"sparsity: $sparsity%.1f%%")
 
 
-	}
+		//println("HERE")
+		//ratingsRDD.collect().foreach(println)
+
+		}
 }
