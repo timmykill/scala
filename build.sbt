@@ -27,6 +27,8 @@ version := "1.0"
 
 libraryDependencies += "org.apache.spark" %% "spark-sql" % "3.5.0"
 libraryDependencies += "org.apache.spark" %% "spark-mllib" % "3.5.0"
+libraryDependencies += "io.github.pityka" %% "nspl-awt" % "0.10.0"
+
 
 
 // Here, `libraryDependencies` is a set of dependencies, and by using `+=`,

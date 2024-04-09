@@ -3,11 +3,29 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types._
 import org.apache.spark.mllib.linalg.distributed.{CoordinateMatrix, MatrixEntry}
-
+import org.nspl._
+import org.nspl.awtrenderer._
+import scala.util.Random
+import java.awt.Panel
+import java.awt.Frame
+import java.awt.Graphics
+import javax.imageio.ImageIO
 
 
 object SimpleApp {
 	def main(args: Array[String]): Unit = {
+
+
+		// QUESTO FUNZIONA, CREA UN JFRAME
+		// val someData = 0 until 100 map (_ => Random.nextDouble() -> Random.nextDouble())
+		// val plot = xyplot(someData)(
+		//             par.withMain("Main label")
+		//             .withXLab("x axis label")
+		//             .withYLab("y axis label")
+		//           )
+		// val (frame, _) = show(plot)
+		// frame.setVisible(true)
+
 		val spark = SparkSession.builder()
 		  .appName("Create Ratings Matrix")
 		  .config("spark.master", "local")
@@ -43,12 +61,13 @@ object SimpleApp {
 			val userId = row.getAs[Int]("user_id")
 			val itemId = row.getAs[Int]("item_id")
 			val rating = row.getAs[Double]("rating")
-			MatrixEntry(userId - 1, itemId - 1, rating)})
+			MatrixEntry(userId - 1, itemId - 1, rating)
+		})
 
-		val coordMatrix = new CoordinateMatrix(entries)
-		val matrix_size : Double = coordMatrix.numRows() * coordMatrix.numCols()
-		println(f"rows: ${coordMatrix.numRows()}")
-		println(f"cols: ${coordMatrix.numCols()}")
+		val ratings = new CoordinateMatrix(entries)
+		val matrix_size : Double = ratings.numRows() * ratings.numCols()
+		println(f"rows: ${ratings.numRows()}")
+		println(f"cols: ${ratings.numCols()}")
 		val interactions = entries.count()
 		println(f"interactions: ${interactions}")
 		val sparsity = 100 * (interactions / matrix_size)
@@ -56,6 +75,26 @@ object SimpleApp {
 		println(f"dimension: ${matrix_size}")
 		println(f"sparsity: $sparsity%.1f%%")
 
+		//get non null entries for every user
+		val notNullByUser = ratings.toRowMatrix().rows
+		           .map(a => a.numNonzeros.toDouble)
+		           .collect()
+		           .sorted(Ordering.Double.IeeeOrdering.reverse).zipWithIndex
+		           .map(a => a._2.toDouble -> a._1).toList
+		val barPlotData = List(1 -> 10, 2 -> 11)
+		
+		val plot8 = xyplot(notNullByUser -> bar(horizontal=false, 
+		                                    width = 0.1, 
+		                                    fill = Color.gray2)
+		            )(
+		             par
+		            .xlab("x axis label")
+		            .ylab("y axis label")
+		            .ylog(true)
+		            .xlim(Some(0d -> 1000d))
+		            )
+		val (frame, _) = show(plot8)
+		frame.setVisible(true)
 
 		//println("HERE")
 		//ratingsRDD.collect().foreach(println)
