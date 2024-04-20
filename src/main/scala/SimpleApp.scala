@@ -2,8 +2,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.types._
-import org.apache.spark.mllib.linalg.distributed.{CoordinateMatrix, MatrixEntry}
-import org.apache.spark.mllib.linalg.DenseVector
+import org.apache.spark.mllib.linalg.distributed.{
+  CoordinateMatrix,
+  MatrixEntry,
+  RowMatrix,
+  BlockMatrix
+}
+import org.apache.spark.mllib.linalg.{DenseVector, Matrices, DenseMatrix}
 import org.nspl._
 import org.nspl.awtrenderer._
 import scala.util.Random
@@ -13,6 +18,12 @@ import java.awt.Graphics
 import javax.imageio.ImageIO
 
 object SimpleApp {
+
+  val spark = SparkSession
+    .builder()
+    .appName("Create Ratings Matrix")
+    .config("spark.master", "local")
+    .getOrCreate()
 
   def create_train_test(ratings: CoordinateMatrix) = {
     val trainIndexes = ratings
@@ -56,6 +67,35 @@ object SimpleApp {
     train -> test
   }
 
+  def predict(user_factors: DenseVector, item_factors: DenseVector): Double = {
+    user_factors.dot(item_factors)
+  }
+
+  def als_step(
+      ratings: CoordinateMatrix,
+      solveVector: DenseVector,
+      fixedVector: DenseVector,
+      lambda: Double
+  ): (DenseVector, DenseVector) = {
+    // A = fixedVector^T * fixedVector + lambda * I
+    val A_1 =
+      new RowMatrix(
+        spark.sparkContext.parallelize(Seq(fixedVector))
+      ).computeGramianMatrix() // gramian matrix: fixedVector^T * fixedVector
+
+    // TODO: add lambda * I somehow. How: BlockMatrix has an add function. How to convert Matrix to BlockMatrix?
+  }
+
+  def fit(
+      train: CoordinateMatrix,
+      features: Int,
+      n_iters: Int
+  ): (DenseVector, DenseVector) = {
+    val usersVector = new DenseVector(Array.fill(features)(Random.nextDouble()))
+    val itemsVector = new DenseVector(Array.fill(features)(Random.nextDouble()))
+
+  }
+
   def main(args: Array[String]): Unit = {
 
     // QUESTO FUNZIONA, CREA UN JFRAME
@@ -68,11 +108,6 @@ object SimpleApp {
     // val (frame, _) = show(plot)
     // frame.setVisible(true)
 
-    val spark = SparkSession
-      .builder()
-      .appName("Create Ratings Matrix")
-      .config("spark.master", "local")
-      .getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
 
     // colonne: user_id item_id rating timestamp
@@ -159,6 +194,10 @@ object SimpleApp {
 
     // println("HERE")
     // ratingsRDD.collect().foreach(println)
+
+    val features = 10
+
+    val n_iters = 100
 
   }
 }
