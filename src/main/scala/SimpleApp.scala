@@ -13,6 +13,38 @@ import javax.imageio.ImageIO
 
 
 object SimpleApp {
+	def create_train_test(ratings: CoordinateMatrix) = {
+		val trainIndexes = ratings.toIndexedRowMatrix().rows
+		                          .map(a => {val i = a.index
+		                                     val f = a.vector.toArray.toList
+		                                              .zipWithIndex
+		                                              .filter(b => b._2 != 0)
+		                                              .map(b => b._1)
+		                                     i -> Random.shuffle(f).take(10)})
+		                          .collect()
+		                          .toMap
+		val train = ratings.toIndexedRowMatrix().rows
+		                   .map(a => {val x = a.vector.toArray.toList
+		                                       .zipWithIndex
+		                                       .map(b => {if (trainIndexes(a.index).contains(b._1)) {
+		                                                     b._1
+		                                                  } else {
+		                                                     0 }}).toArray
+		                              val y = DenseVector(x)
+		                              a.index -> y})
+
+		                          testIndexes(a.index).contains(a.j)))
+		val test = new CoordinateMatrix(ratings.entries
+		                  .filter(a => !testIndexes(a.i).contains(a.j)))
+
+		assert(train.toRowMatrix()
+		            .multiply(test.transpose().toBlockMatrix().toLocalMatrix())
+		            .rows.map(a => a.numNonzeros)
+		            .filter(a => a != 0).count() == 0)
+
+		train -> test
+	}
+
 	def main(args: Array[String]): Unit = {
 
 
@@ -95,6 +127,11 @@ object SimpleApp {
 		            )
 		val (frame, _) = show(plot8)
 		frame.setVisible(true)
+
+		val (train, test) = create_train_test(ratings)
+		
+		println("HERE")
+		println(train.toString())
 
 		//println("HERE")
 		//ratingsRDD.collect().foreach(println)
