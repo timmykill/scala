@@ -16,6 +16,7 @@ import java.awt.Panel
 import java.awt.Frame
 import java.awt.Graphics
 import javax.imageio.ImageIO
+import org.apache.spark.rdd.RDD
 
 object SimpleApp {
 
@@ -77,14 +78,33 @@ object SimpleApp {
       fixedVector: DenseVector,
       lambda: Double
   ): (DenseVector, DenseVector) = {
-    // A = fixedVector^T * fixedVector + lambda * I
+    // A = fixed_vecs.T.dot(fixed_vecs) + np.eye(self.n_factors) * self.reg
     val A_1 =
       new RowMatrix(
         spark.sparkContext.parallelize(Seq(fixedVector))
       ).computeGramianMatrix() // gramian matrix: fixedVector^T * fixedVector
+    val entries: RDD[MatrixEntry] = spark.sparkContext.parallelize(
+      for (i <- 0 until A_1.numRows.toInt;
+           j <- 0 until A_1.numCols.toInt)
+        yield MatrixEntry(i, j, A_1(i, j))
+    )
+    val A_2 = new CoordinateMatrix(entries).toBlockMatrix()
+    val _lambdaEye = spark.sparkContext.parallelize(
+      for (i <- 0 until fixedVector.size)
+        yield MatrixEntry(i,i,lambda))
+    val lambdaEye = new CoordinateMatrix(lambdaEye).toBlockMatrix()
+    val A = A_2.add(lambdaEye)
 
-    // TODO: add lambda * I somehow. How: BlockMatrix has an add function. How to convert Matrix to BlockMatrix?
+    // b = ratings.dot(fixed_vecs)
+    val fV_asMatrix = new CoordinateMatrix(fixedVector.values.zipWithIndex
+                      .map(v, i => new MatrixEntry(i, 0, v))).toBlockMatrix()
+    val b = A.multiply(fV_asMatrix)
+
+    // A_inv = np.linalg.inv(A)
+    // solve_vecs = b.dot(A_inv)
+    // return solve_vecs
   }
+
 
   def fit(
       train: CoordinateMatrix,
