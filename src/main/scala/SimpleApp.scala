@@ -17,6 +17,7 @@ import java.awt.Frame
 import java.awt.Graphics
 import javax.imageio.ImageIO
 import org.apache.spark.rdd.RDD
+import org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix
 
 object SimpleApp {
 
@@ -77,7 +78,7 @@ object SimpleApp {
       solveVector: DenseVector,
       fixedVector: DenseVector,
       lambda: Double
-  ): (DenseVector, DenseVector) = {
+  ): BlockMatrix = {
     // A = fixed_vecs.T.dot(fixed_vecs) + np.eye(self.n_factors) * self.reg
     val A_1 =
       new RowMatrix(
@@ -92,19 +93,53 @@ object SimpleApp {
     val _lambdaEye = spark.sparkContext.parallelize(
       for (i <- 0 until fixedVector.size)
         yield MatrixEntry(i,i,lambda))
-    val lambdaEye = new CoordinateMatrix(lambdaEye).toBlockMatrix()
+    val lambdaEye = new CoordinateMatrix(_lambdaEye).toBlockMatrix()
     val A = A_2.add(lambdaEye)
 
     // b = ratings.dot(fixed_vecs)
-    val fV_asMatrix = new CoordinateMatrix(fixedVector.values.zipWithIndex
-                      .map(v, i => new MatrixEntry(i, 0, v))).toBlockMatrix()
+    val fV_asMatrix = new CoordinateMatrix(
+                        spark.sparkContext.parallelize(
+                          fixedVector.values.zipWithIndex
+                          .map(t => new MatrixEntry(t._2, 0, t._1))))
+                          .toBlockMatrix()
     val b = A.multiply(fV_asMatrix)
 
     // A_inv = np.linalg.inv(A)
+    val _dense_A_inv = computeInverse(A.toIndexedRowMatrix())
+    val A_inv = new CoordinateMatrix(
+      spark.sparkContext.parallelize(
+        for (i <- 0 until _dense_A_inv.numRows.toInt;
+             j <- 0 until _dense_A_inv.numCols.toInt)
+          yield MatrixEntry(i, j, _dense_A_inv(i, j))
+      )).toBlockMatrix()
+    
     // solve_vecs = b.dot(A_inv)
+    val solve_vecs = b.multiply(A_inv)
+
     // return solve_vecs
+    return solve_vecs
   }
 
+
+  // TODO: vedere se riusciamo a farlo distribuito
+  def computeInverse(X: IndexedRowMatrix): DenseMatrix = {
+    val nCoef = X.numCols.toInt
+    val svd = X.computeSVD(nCoef, computeU = true)
+    if (svd.s.size < nCoef) {
+      sys.error(s"RowMatrix.computeInverse called on singular matrix.")
+    }
+
+    // Create the inv diagonal matrix from S 
+    val invS = DenseMatrix.diag(new DenseVector(svd.s.toArray.map(x => math.pow(x,-1))))
+
+    // U cannot be a RowMatrix
+    val U = new DenseMatrix(svd.U.numRows().toInt,svd.U.numCols().toInt,svd.U.rows.collect.flatMap(x => x.toArray))
+
+    // If you could make V distributed, then this may be better. However its alreadly local...so maybe this is fine.
+    val V = svd.V
+    // inv(X) = V*inv(S)*transpose(U)  --- the U is already transposed.
+    (V.multiply(invS)).multiply(U)
+  }
 
   def fit(
       train: CoordinateMatrix,
