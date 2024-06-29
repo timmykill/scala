@@ -18,6 +18,8 @@ import java.awt.Graphics
 import javax.imageio.ImageIO
 import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix
+import org.apache.spark.mllib.linalg.Matrix
+import org.apache.spark.mllib.linalg.CholeskyDecomposition
 
 object SimpleApp {
 
@@ -28,6 +30,7 @@ object SimpleApp {
     .getOrCreate()
 
   def create_train_test(ratings: CoordinateMatrix) = {
+    // TODO: questo può essere sicuramente fatto anche senza passare per IndexedRowMatrix
     val trainIndexes = ratings
       .toIndexedRowMatrix()
       .rows
@@ -73,82 +76,56 @@ object SimpleApp {
     user_factors.dot(item_factors)
   }
 
-  def als_step(
-      ratings: CoordinateMatrix,
-      solveVector: DenseVector,
-      fixedVector: DenseVector,
-      lambda: Double
-  ): BlockMatrix = {
-    // A = fixed_vecs.T.dot(fixed_vecs) + np.eye(self.n_factors) * self.reg
-    val A_1 =
-      new RowMatrix(
-        spark.sparkContext.parallelize(Seq(fixedVector))
-      ).computeGramianMatrix() // gramian matrix: fixedVector^T * fixedVector
-    val entries: RDD[MatrixEntry] = spark.sparkContext.parallelize(
-      for (i <- 0 until A_1.numRows.toInt;
-           j <- 0 until A_1.numCols.toInt)
-        yield MatrixEntry(i, j, A_1(i, j))
-    )
-    val A_2 = new CoordinateMatrix(entries).toBlockMatrix()
-    val _lambdaEye = spark.sparkContext.parallelize(
-      for (i <- 0 until fixedVector.size)
-        yield MatrixEntry(i,i,lambda))
-    val lambdaEye = new CoordinateMatrix(_lambdaEye).toBlockMatrix()
-    val A = A_2.add(lambdaEye)
+  def U_als_step(features: Integer, lambda: Integer, ratings: CoordinateMatrix, M: DenseMatrix) = {
+    ratings.toIndexedRowMatrix().rows.map(index_row => {
+      val index = index_row.index
+      val row = index_row.vector
 
-    // b = ratings.dot(fixed_vecs)
-    val fV_asMatrix = new CoordinateMatrix(
-                        spark.sparkContext.parallelize(
-                          fixedVector.values.zipWithIndex
-                          .map(t => new MatrixEntry(t._2, 0, t._1))))
-                          .toBlockMatrix()
-    val b = A.multiply(fV_asMatrix)
-
-    // A_inv = np.linalg.inv(A)
-    val _dense_A_inv = computeInverse(A.toIndexedRowMatrix())
-    val A_inv = new CoordinateMatrix(
-      spark.sparkContext.parallelize(
-        for (i <- 0 until _dense_A_inv.numRows.toInt;
-             j <- 0 until _dense_A_inv.numCols.toInt)
-          yield MatrixEntry(i, j, _dense_A_inv(i, j))
-      )).toBlockMatrix()
-    
-    // solve_vecs = b.dot(A_inv)
-    val solve_vecs = b.multiply(A_inv)
-
-    // return solve_vecs
-    return solve_vecs
-  }
+      // invariante: non_zero_movies è crescente
+      val non_zero_movies= row.toArray.zipWithIndex.filter {
+        case (0, _) => false
+        case (_, _) => true
+      }     
+      val non_zero_movies_index = non_zero_movies map {
+        case (v, i) => i
+      }
+      val non_zero_movies_values = non_zero_movies map {
+        case (v, i) => v
+      }
 
 
-  // TODO: vedere se riusciamo a farlo distribuito
-  def computeInverse(X: IndexedRowMatrix): DenseMatrix = {
-    val nCoef = X.numCols.toInt
-    val svd = X.computeSVD(nCoef, computeU = true)
-    if (svd.s.size < nCoef) {
-      sys.error(s"RowMatrix.computeInverse called on singular matrix.")
-    }
+      // assert che sia column major
+      assert(!M.isTransposed)
+      // usa direttamente la funzione `values` sulla dense matrix
+      // crea una nuova dense matrix lavorando direttamente sull'array di 
+      // Double sottostante
+      val Mm_array = new Array[Double](non_zero_movies_index.length * features)
+      var to_i = 0
+      for (from_i <- 0 until M.numCols) {
+        if (from_i == non_zero_movies_index(to_i)) {
+           Array.copy(M.values,
+                       from_i * features,
+                       Mm_array,
+                       to_i * features,
+                       features)
+           to_i += 1
+        }
+      }
+      // all non zero movies should be in the new matrix
+      assert(to_i == non_zero_movies_index.length - 1)
+      val Mm = new DenseMatrix(non_zero_movies_index.length, features, Mm_array)
 
-    // Create the inv diagonal matrix from S 
-    val invS = DenseMatrix.diag(new DenseVector(svd.s.toArray.map(x => math.pow(x,-1))))
+      val tmp = Mm.multiply(Mm.transpose).values
+      val A_sup = new Array[Double]((features * (features + 1)) / 2)
+      for (i <- 0 until features) {
+        Array.copy(tmp, (i * features), A_sup, (i*(i+1))/2, i)
+        A_sup(((i*(i+1))/2)-1) = tmp((i * features) + i) * lambda * non_zero_movies.length
+      }
 
-    // U cannot be a RowMatrix
-    val U = new DenseMatrix(svd.U.numRows().toInt,svd.U.numCols().toInt,svd.U.rows.collect.flatMap(x => x.toArray))
+      val V = Mm.multiply(new DenseVector(non_zero_movies_values)).toArray
 
-    // If you could make V distributed, then this may be better. However its alreadly local...so maybe this is fine.
-    val V = svd.V
-    // inv(X) = V*inv(S)*transpose(U)  --- the U is already transposed.
-    (V.multiply(invS)).multiply(U)
-  }
-
-  def fit(
-      train: CoordinateMatrix,
-      features: Int,
-      n_iters: Int
-  ): (DenseVector, DenseVector) = {
-    val usersVector = new DenseVector(Array.fill(features)(Random.nextDouble()))
-    val itemsVector = new DenseVector(Array.fill(features)(Random.nextDouble()))
-
+      CholeskyDecomposition.solve(A_sup, V)
+    })
   }
 
   def main(args: Array[String]): Unit = {
@@ -195,11 +172,6 @@ object SimpleApp {
       .asInstanceOf[Number]
       .intValue()
 
-    // val bigArray = Array(nUsers * nItems)
-    // ratings.map(row => {
-    //	case (userId, itemId, rating, _) => {
-    //		bigArray(userId * nUsers + itemId) = rating}})
-
     val entries = df.rdd.map(row => {
       val userId = row.getAs[Int]("user_id")
       val itemId = row.getAs[Int]("item_id")
@@ -207,10 +179,14 @@ object SimpleApp {
       MatrixEntry(userId - 1, itemId - 1, rating)
     })
 
+    // CoordinateMatrix è una matrice distribuita
+    // utilizza COO per memorizzarla (in pratica è una lista di entry)
     val ratings = new CoordinateMatrix(entries)
+
     val matrix_size: Double = ratings.numRows() * ratings.numCols()
     println(f"rows: ${ratings.numRows()}")
     println(f"cols: ${ratings.numCols()}")
+
     val interactions = entries.count()
     println(f"interactions: ${interactions}")
     val sparsity = 100 * (interactions / matrix_size)
@@ -251,8 +227,30 @@ object SimpleApp {
     // ratingsRDD.collect().foreach(println)
 
     val features = 10
-
     val n_iters = 100
+
+    // Ora dobbiamo usare ALS per decomporre ratings in due matrici di
+    // dimensione U: features x users, M: features x movies
+    // PER FARLO:
+    //  * partiamo con un M in cui la prima riga corrisponde alla media del
+    //    rating per quel film e gli altri valori sono random
+    //  * mandiamo M ad ogni nodo, distribuiamo ratings per righe e calcoliamo
+    //    in modo distribuito la U che riduce l'errore (distanza euclidea)
+    //  * collezioniamo U in locale su ogni nodo
+    //  * ripetiamo l'operazione, ma con ratings distribuito per colonne
+    
+    val first_M_array = Array[Double](nItems * features)
+    ratings.entries.map(a => a.j -> (1, a.value))
+                     .foldByKey((0,0))((a, b) => (a._1 + b._1) -> (a._2 + b._2))
+                     .map(a => a._1 -> (a._2._2 / a._2._2))
+                     .collect().foreach {
+                       case (i1, v) => first_M_array(i1.toInt) = v
+                                      for (i2 <- 1 until features) {
+        // il paper qui dice "small random value", se si rompe in modo strano
+        // questo potrebbe essere il motivo
+                                        first_M_array(i1.toInt + i2.toInt) = Random.nextDouble()
+                                      }}
+    val M = Matrices.dense(features, nItems, first_M_array)
 
   }
 }
