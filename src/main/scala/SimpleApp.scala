@@ -76,8 +76,8 @@ object SimpleApp {
     user_factors.dot(item_factors)
   }
 
-  def U_als_step(features: Integer, lambda: Integer, ratings: CoordinateMatrix, M: DenseMatrix) = {
-    ratings.toIndexedRowMatrix().rows.map(index_row => {
+  def U_als_step(features: Integer, users: Integer, lambda: Integer, ratings: CoordinateMatrix, M: DenseMatrix) = {
+    val U_arr = ratings.toIndexedRowMatrix().rows.map(index_row => {
       val index = index_row.index
       val row = index_row.vector
 
@@ -86,6 +86,11 @@ object SimpleApp {
         case (0, _) => false
         case (_, _) => true
       }     
+      // print("non_zero_movies: ")
+      // non_zero_movies.foreach {
+      //   case (v, i) => print(s"($i, $v) ")
+      // }
+      // println()
       val non_zero_movies_index = non_zero_movies map {
         case (v, i) => i
       }
@@ -101,7 +106,7 @@ object SimpleApp {
       // Double sottostante
       val Mm_array = new Array[Double](non_zero_movies_index.length * features)
       var to_i = 0
-      for (from_i <- 0 until M.numCols) {
+      for (from_i <- 0 to non_zero_movies_index.last) {
         if (from_i == non_zero_movies_index(to_i)) {
            Array.copy(M.values,
                        from_i * features,
@@ -112,20 +117,62 @@ object SimpleApp {
         }
       }
       // all non zero movies should be in the new matrix
-      assert(to_i == non_zero_movies_index.length - 1)
-      val Mm = new DenseMatrix(non_zero_movies_index.length, features, Mm_array)
+      assert(to_i == non_zero_movies_index.length)
+      val Mm = new DenseMatrix(features, non_zero_movies_index.length, Mm_array)
 
       val tmp = Mm.multiply(Mm.transpose).values
-      val A_sup = new Array[Double]((features * (features + 1)) / 2)
+      // Avere solo il "triangolo superiore" di A può essere utile per
+      // utilizzare il metodo di Cholesky
+      // val A_sup = new Array[Double]((features * (features + 1)) / 2)
+      // for (i <- 0 until features) {
+      //   Array.copy(tmp, (i * features), A_sup, (i*(i+1))/2, i)
+      //   A_sup(((i*(i+1))/2)-1) = tmp((i * features) + i) + lambda * non_zero_movies.length
+      // }
+      //
       for (i <- 0 until features) {
-        Array.copy(tmp, (i * features), A_sup, (i*(i+1))/2, i)
-        A_sup(((i*(i+1))/2)-1) = tmp((i * features) + i) * lambda * non_zero_movies.length
+        val j = i + (features * i)
+        tmp(j) = tmp(j) + lambda * non_zero_movies.length
       }
 
       val V = Mm.multiply(new DenseVector(non_zero_movies_values)).toArray
+      gauss_method(features, tmp, V)
+    }).reduce(_++_)
+    new DenseMatrix(features, users, U_arr)
+  }
 
-      CholeskyDecomposition.solve(A_sup, V)
-    })
+  // lavora in-place su A,B (forse, sinceramente bho)
+  def gauss_method(n: Integer, A: Array[Double], B: Array[Double]): Array[Double] = {
+    // For k = 1 : n Do:
+    //   For i = 1 : n and if i! = k Do :
+    //     piv := aik/akk
+    //     For j := k + 1 : n + 1 Do :
+    //       aij := aij − piv ∗ akj
+    //     End
+    //   End
+    // End
+    
+    // questa operazione non vogliamo faccia una copia (va verificato)
+    val C = A ++ B
+
+    for (k <- 0 until n) {
+      for (i <- 0 until n) {
+        if (i != k){
+          // come facciamo se C_{k,k} è zero?
+          val piv = C(i + (k * n)) / C(k + (k *n))
+          for (j <- k until (n + 1)) {
+            val jn = j * n
+            C(i + jn) = C(i + jn) - piv * C(k + jn)
+          }
+        }
+      }
+    }
+
+    val ret = new Array[Double](n)
+    for (i <- 0 until n) { 
+      ret(i) = C(i + (i * n)) / C((n * n) + i)
+    }
+
+    ret
   }
 
   def main(args: Array[String]): Unit = {
@@ -239,10 +286,10 @@ object SimpleApp {
     //  * collezioniamo U in locale su ogni nodo
     //  * ripetiamo l'operazione, ma con ratings distribuito per colonne
     
-    val first_M_array = Array[Double](nItems * features)
+    val first_M_array = new Array[Double](nItems * features)
     ratings.entries.map(a => a.j -> (1, a.value))
                      .foldByKey((0,0))((a, b) => (a._1 + b._1) -> (a._2 + b._2))
-                     .map(a => a._1 -> (a._2._2 / a._2._2))
+                     .map(a => a._1 -> (a._2._2 / a._2._1))
                      .collect().foreach {
                        case (i1, v) => first_M_array(i1.toInt) = v
                                       for (i2 <- 1 until features) {
@@ -250,7 +297,10 @@ object SimpleApp {
         // questo potrebbe essere il motivo
                                         first_M_array(i1.toInt + i2.toInt) = Random.nextDouble()
                                       }}
-    val M = Matrices.dense(features, nItems, first_M_array)
+    val M = new DenseMatrix(features, nItems, first_M_array)
+    val U = U_als_step(features, nUsers, 10, ratings, M)
+
+    println(U)
 
   }
 }
