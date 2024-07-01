@@ -9,7 +9,7 @@ import org.apache.spark.mllib.linalg.distributed.{
 }
 import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
-import SimpleApp.SimpleApp.U_als_step
+import SimpleApp.SimpleApp.als_step
 
 class UAlsStepSpec extends AnyFlatSpec with Matchers  {
 
@@ -32,7 +32,7 @@ class UAlsStepSpec extends AnyFlatSpec with Matchers  {
         val lambda = 10
         
         val expectedMatrix = Matrices.dense(3, 3, Array[Double](1/11.0, 0.0, 0.0, 0.0, 2/11.0, 0.0, 0.0, 0.0, 3/11.0))
-        val resultMatrix = U_als_step(features, numUsers, lambda, ratings, M)
+        val resultMatrix = als_step(lambda, ratings, M)
 
         resultMatrix shouldEqual expectedMatrix
     }

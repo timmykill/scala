@@ -74,12 +74,9 @@ package SimpleApp
       train -> test
     }
 
-    def predict(user_factors: DenseVector, item_factors: DenseVector): Double = {
-      user_factors.dot(item_factors)
-    }
-
-    def U_als_step(features: Integer, users: Integer, lambda: Integer, ratings: CoordinateMatrix, M: DenseMatrix) = {
-      val U_arr = ratings.toIndexedRowMatrix().rows.map(index_row => {
+    def als_step(lambda: Integer, ratings: CoordinateMatrix, from: DenseMatrix) = {
+      val features = from.numRows
+      val to_arr = ratings.toIndexedRowMatrix().rows.map(index_row => {
         val index = index_row.index
         val row = index_row.vector
 
@@ -102,7 +99,7 @@ package SimpleApp
 
 
         // assert che sia column major
-        assert(!M.isTransposed)
+        assert(!from.isTransposed)
         // usa direttamente la funzione `values` sulla dense matrix
         // crea una nuova dense matrix lavorando direttamente sull'array di 
         // Double sottostante
@@ -110,7 +107,7 @@ package SimpleApp
         var to_i = 0
         for (from_i <- 0 to non_zero_movies_index.last) {
           if (from_i == non_zero_movies_index(to_i)) {
-            Array.copy(M.values,
+            Array.copy(from.values,
                         from_i * features,
                         Mm_array,
                         to_i * features,
@@ -140,7 +137,7 @@ package SimpleApp
         index -> gauss_method(features, tmp, V)
       //}).sortByKey().map {case(i,v) => v}.reduce(_++_)
       }).collect().sortWith((a, b) => a._1 < b._1 ).map {case(i,v) => v}.reduce(_++_)
-      new DenseMatrix(features, users, U_arr)
+      new DenseMatrix(features, ratings.numRows.toInt, to_arr)
     }
 
     // lavora in-place su A,B (forse, sinceramente bho)
@@ -301,11 +298,25 @@ package SimpleApp
           // questo potrebbe essere il motivo
                                           first_M_array(i1.toInt + i2.toInt) = Random.nextDouble()
                                         }}
-      val M = new DenseMatrix(features, nItems, first_M_array)
-      val U = U_als_step(features, nUsers, 10, ratings, M)
-
-      println(U)
-
+      var M = new DenseMatrix(features, nItems, first_M_array)
+      var U = als_step(features, ratings, M)
+      val ratings_t = ratings.transpose()
+      for (iter <- 0 until n_iters) {
+        U = als_step(features, ratings, M)
+        M = als_step(features, ratings_t, U)
+        // calcolo errore:
+        val err = ratings.entries.map {
+          case MatrixEntry(i, j, v) => {
+            val Uval = U.values
+            val Mval = M.values
+            (for (fi <- 0 until features)
+              yield Uval(i.toInt * features + fi) 
+                    * Mval(j.toInt * features + fi))
+              .reduce(_+_)
+          }
+        }.reduce(_+_)
+        println(s"iter: $iter, error: $err")
+      }
     }
   }
 }
