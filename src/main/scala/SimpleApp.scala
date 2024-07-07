@@ -21,8 +21,7 @@ import org.apache.spark.mllib.linalg.distributed.IndexedRowMatrix
 import org.apache.spark.mllib.linalg.Matrix
 import org.apache.spark.mllib.linalg.CholeskyDecomposition
 
-package SimpleApp
-{
+package SimpleApp {
   object SimpleApp {
 
     val spark = SparkSession
@@ -32,25 +31,29 @@ package SimpleApp
       .getOrCreate()
 
     def create_train_test(ratings: CoordinateMatrix) = {
-      // TODO: questo può essere sicuramente fatto anche senza passare per IndexedRowMatrix
+      // TODO: this can be probably done without using IndexedRowMatrix
       val trainIndexes = ratings
         .toIndexedRowMatrix()
         .rows
-        .map(a => {
-          val i = a.index
-          val f = a.vector.toArray.toList.zipWithIndex
-            .filter(b => b._1 != 0)
-            .map(b => b._2)
-          // Non prendere mai l'ultima 
-          //
-          i -> Random.shuffle(f).take(10)
+        .map(user => {
+          val userId = user.index
+          val ratedMovies = user.vector.toArray.toList.zipWithIndex
+            .filter(indexedRating =>
+              indexedRating._1 != 0 // filter out the movies that have not been rated by the user
+            )
+            .map(indexedNonZeroRating =>
+              indexedNonZeroRating._2 // keep only the indexes of the movies
+            )
+          // never take the last
+          // TODO: why?
+          userId -> Random.shuffle(ratedMovies).take(10)
         })
         .collect()
         .toMap
 
       val train = new CoordinateMatrix(
         ratings.entries
-          .filter(a => trainIndexes(a.i).contains(a.j)),
+          .filter(entry => trainIndexes(entry.i).contains(entry.j)),
         ratings.numRows(),
         ratings.numCols()
       )
@@ -65,10 +68,10 @@ package SimpleApp
       // assert that train and test are disjoint
       assert(
         train.entries
-          .map(a => (a.i, a.j))
+          .map(trainEntry => (trainEntry.i, trainEntry.j))
           .intersection(
             test.entries
-              .map(a => (a.i, a.j))
+              .map(testEntry => (testEntry.i, testEntry.j))
           )
           .count() == 0
       )
@@ -81,96 +84,115 @@ package SimpleApp
       assert(ratings.numRows() == train.numRows())
       assert(ratings.numRows() == test.numRows())
 
-      println("the assert is true!")
+      println("the asserts are true!")
       println("train entries: ", train.entries.count())
       println("test entries: ", test.entries.count())
 
       train -> test
     }
 
-    def als_step(lambda: Integer, ratings: CoordinateMatrix, from: DenseMatrix) = {
-      val features = from.numRows
-      val to_unordered = ratings.toIndexedRowMatrix().rows.map(index_row => {
-        val index = index_row.index
-        val row = index_row.vector
+    def als_step(
+        lambda: Integer, // regularization parameter
+        ratings: CoordinateMatrix, // ratings matrix
+        from: DenseMatrix // fixed matrix
+    ) = {
+      val nFeatures = from.numRows
+      val to_unordered = ratings
+        .toIndexedRowMatrix()
+        .rows
+        .map(user => {
+          val userId = user.index
+          val userRatings = user.vector
 
-        // invariante: non_zero_movies è crescente
-        val non_zero_movies= row.toArray.zipWithIndex.filter {
-          case (0, _) => false
-          case (_, _) => true
-        }     
-        assert(non_zero_movies.length > 0)
+          // invariant: nonZeroMovies is sorted in ascending order
+          val indexedNonZeroMovies = userRatings.toArray.zipWithIndex.filter {
+            case (0, _) => false
+            case (_, _) => true
+          } // only keep the movies that have been rated
+          assert(indexedNonZeroMovies.length > 0)
 
-        // print("non_zero_movies: ")
-        // non_zero_movies.foreach {
-        //   case (v, i) => print(s"($i, $v) ")
-        // }
-        // println()
-        val non_zero_movies_index = non_zero_movies map {
-          case (v, i) => i
-        }
-        val non_zero_movies_values = non_zero_movies map {
-          case (v, i) => v
-        }
+          val nonZeroMoviesIds =
+            indexedNonZeroMovies map { case (rating, index) =>
+              index
+            }
+          val nonZeroMoviesRatings =
+            indexedNonZeroMovies map { case (rating, index) =>
+              rating
+            }
 
+          // assert che sia column major
+          assert(!from.isTransposed)
+          /*
+            directly use the `values` function on the dense matrix
+            create a new dense matrix working directly on the underlying
+            Double array
 
-        // assert che sia column major
-        assert(!from.isTransposed)
-        // usa direttamente la funzione `values` sulla dense matrix
-        // crea una nuova dense matrix lavorando direttamente sull'array di 
-        // Double sottostante
-        //
-        // Cosa fa? (esempio dove la from sono i movies (M) e le righe di
-        // ratings sono utenti)
-        // prende, dalla matrice M solo i film (quindi le colonne) di cui
-        // l'utente ha fatto una recensione
-        // Mm è questa sottomatrice
-        val Mm_array = new Array[Double](non_zero_movies_index.length * features)
-        var to_i = 0
-        for (from_i <- 0 to non_zero_movies_index.last) {
-          if (from_i == non_zero_movies_index(to_i)) {
-            Array.copy(from.values,
-                        from_i * features,
-                        Mm_array,
-                        to_i * features,
-                        features)
-            to_i += 1
+            What does it do? (example where `from` are the movies (M) and the rows of
+            ratings are users)
+            take, from the M matrix, only the movies (so the columns) that the
+            user has reviewed
+            Mm is this submatrix
+           */
+          val Mm_array =
+            new Array[Double](nonZeroMoviesIds.length * nFeatures)
+
+          // for each movie that the user has rated
+          // copy the movie from the M matrix to the Mm matrix
+          var toMovieId = 0
+          for (fromMovieId <- 0 to nonZeroMoviesIds.last) {
+            if (fromMovieId == nonZeroMoviesIds(toMovieId)) {
+              Array.copy(
+                from.values,
+                fromMovieId * nFeatures,
+                Mm_array,
+                toMovieId * nFeatures,
+                nFeatures
+              )
+              toMovieId += 1
+            }
           }
-        }
-        // all non zero movies should be in the new matrix
-        assert(to_i == non_zero_movies_index.length)
-        val Mm = new DenseMatrix(features, non_zero_movies_index.length, Mm_array)
+          // all non zero movies should be in the new matrix
+          assert(toMovieId == nonZeroMoviesIds.length)
+          val Mm =
+            new DenseMatrix(nFeatures, nonZeroMoviesIds.length, Mm_array)
 
-        val tmp = Mm.multiply(Mm.transpose).values
-        for (i <- 0 until features) {
-          val j = i + (features * i)
-          tmp(j) = tmp(j) + lambda * non_zero_movies.length
-        }
+          val tmp = Mm.multiply(Mm.transpose).values // Mm * Mm^T
+          for (i <- 0 until nFeatures) {
+            val j = i + (nFeatures * i)
+            tmp(j) = tmp(j) + lambda * indexedNonZeroMovies.length
+          }
 
-        val V = Mm.multiply(new DenseVector(non_zero_movies_values)).toArray
-        index -> gauss_method(features, tmp, V)
-      //}).sortByKey().map {case(i,v) => v}.reduce(_++_)
-      }).collect()
+          val V = Mm.multiply(new DenseVector(nonZeroMoviesRatings)).toArray
+          userId -> gauss_method(nFeatures, tmp, V)
+          // }).sortByKey().map {case(i,v) => v}.reduce(_++_)
+        })
+        .collect()
 
-      val ret_array = new Array[Double](ratings.numRows().toInt * features)
+      val ret_array = new Array[Double](ratings.numRows().toInt * nFeatures)
       // in questo ciclo faccio due operazioni:
       //  * ordino l'ouput dei vari nodi
       //  * riempio con zeri le colonne degli utenti di cui non so nulla.
       //    Per fare una cosa fatta bene servirebbe una cold-start strategy,
       //    ma sinceramente non mi interessa
       for (i <- 0 until to_unordered.length) {
-          Array.copy(to_unordered(i)._2,
-                      0,
-                      ret_array,
-                      to_unordered(i)._1.toInt * features,
-                      features)
+        Array.copy(
+          to_unordered(i)._2,
+          0,
+          ret_array,
+          to_unordered(i)._1.toInt * nFeatures,
+          nFeatures
+        )
       }
 
-      new DenseMatrix(features, ratings.numRows.toInt, ret_array)
+      new DenseMatrix(nFeatures, ratings.numRows.toInt, ret_array)
     }
 
     // lavora in-place su A,B (forse, sinceramente bho)
-    def gauss_method(n: Integer, A: Array[Double], B: Array[Double]): Array[Double] = {
+    def gauss_method(
+        n: Integer,
+        A: Array[Double],
+        B: Array[Double]
+    ): Array[Double] = {
       // For k = 1 : n Do:
       //   For i = 1 : n and if i! = k Do :
       //     piv := aik/akk
@@ -179,16 +201,16 @@ package SimpleApp
       //     End
       //   End
       // End
-      
+
       // questa operazione non vogliamo faccia una copia (va verificato)
       val C = A ++ B
 
       for (k <- 0 until n) {
         for (i <- 0 until n) {
-          if (i != k){
+          if (i != k) {
             // come facciamo se C_{k,k} è zero?
-            assert(C(k + (k*n)) != 0.0)
-            val piv = C(i + (k * n)) / C(k + (k *n))
+            assert(C(k + (k * n)) != 0.0)
+            val piv = C(i + (k * n)) / C(k + (k * n))
             for (j <- k until (n + 1)) {
               val jn = j * n
               C(i + jn) = C(i + jn) - piv * C(k + jn)
@@ -198,7 +220,7 @@ package SimpleApp
       }
 
       val ret = new Array[Double](n)
-      for (i <- 0 until n) { 
+      for (i <- 0 until n) {
         ret(i) = C((n * n) + i) / C(i + (i * n))
       }
 
@@ -207,19 +229,21 @@ package SimpleApp
 
     def main(args: Array[String]): Unit = {
 
-      // QUESTO FUNZIONA, CREA UN JFRAME
-      // val someData = 0 until 100 map (_ => Random.nextDouble() -> Random.nextDouble())
-      // val plot = xyplot(someData)(
-      //             par.withMain("Main label")
-      //             .withXLab("x axis label")
-      //             .withYLab("y axis label")
-      //           )
-      // val (frame, _) = show(plot)
-      // frame.setVisible(true)
+      /*
+       QUESTO FUNZIONA, CREA UN JFRAME
+       val someData = 0 until 100 map (_ => Random.nextDouble() -> Random.nextDouble())
+       val plot = xyplot(someData)(
+                   par.withMain("Main label")
+                   .withXLab("x axis label")
+                   .withYLab("y axis label")
+                 )
+       val (frame, _) = show(plot)
+       frame.setVisible(true)
+       */
 
       spark.sparkContext.setLogLevel("ERROR")
 
-      // colonne: user_id item_id rating timestamp
+      // columns: user_id item_id rating timestamp
       val customSchema = StructType(
         Array(
           StructField("user_id", IntegerType, true),
@@ -238,53 +262,53 @@ package SimpleApp
 
       df.show()
 
-      val nUsers = df
-        .select(countDistinct("user_id"))
-        .collect()(0)(0)
-        .asInstanceOf[Number]
-        .intValue()
-      val nItems = df
-        .select(countDistinct("item_id"))
-        .collect()(0)(0)
-        .asInstanceOf[Number]
-        .intValue()
-
+      // list of matrix entries needed to create the coordinate matrix
       val entries = df.rdd.map(row => {
         val userId = row.getAs[Int]("user_id")
         val itemId = row.getAs[Int]("item_id")
         val rating = row.getAs[Double]("rating")
-        MatrixEntry(userId - 1, itemId - 1, rating)
+        MatrixEntry(userId - 1, itemId - 1, rating) // row, column, value
       })
 
-      // CoordinateMatrix è una matrice distribuita
-      // utilizza COO per memorizzarla (in pratica è una lista di entry)
+      // CoordinateMatrix is a distributed matrix which
+      // uses COO as the underlying storage (which is, in practice, a list of matrix entries)
+      // ideally sorted first by row, then by column
       val ratings = new CoordinateMatrix(entries)
 
-      val matrix_size: Double = ratings.numRows() * ratings.numCols()
+      val matrixSize: Double = ratings.numRows() * ratings.numCols()
       println(f"rows: ${ratings.numRows()}")
       println(f"cols: ${ratings.numCols()}")
 
       val interactions = entries.count()
       println(f"interactions: ${interactions}")
-      val sparsity = 100 * (interactions / matrix_size)
+      val sparsity = 100 * (interactions / matrixSize)
 
-      println(f"dimension: ${matrix_size}")
+      println(f"dimension: ${matrixSize}")
       println(f"sparsity: $sparsity%.1f%%")
 
+      /*
       // get non null entries for every user
       val notNullByUser = ratings
         .toRowMatrix()
         .rows
-        .map(a => a.numNonzeros.toDouble)
+        .map(user =>
+          user.numNonzeros.toDouble // number of movies rated by the user
+        )
         .collect()
-        .sorted(Ordering.Double.IeeeOrdering.reverse)
+        .sorted(
+          Ordering.Double.IeeeOrdering.reverse // sort in descending order to get the most active users first
+        )
         .zipWithIndex
-        .map(a => a._2.toDouble -> a._1)
+        .map(a => a._2.toDouble -> a._1 // from (value, index) to (index, value)
+        )
         .toList
-      val barPlotData = List(1 -> 10, 2 -> 11)
 
       val plot8 = xyplot(
-        notNullByUser -> bar(horizontal = false, width = 0.1, fill = Color.gray2)
+        notNullByUser -> bar(
+          horizontal = false,
+          width = 0.1,
+          fill = Color.gray2
+        )
       )(
         par
           .xlab("x axis label")
@@ -292,59 +316,74 @@ package SimpleApp
           .ylog(true)
           .xlim(Some(0d -> 1000d))
       )
-      // val (frame, _) = show(plot8)
-      // non mostrare il grafico tutte le volte
-      // frame.setVisible(true)
+      val (frame, _) = show(plot8)
+      // // don't show it every time
+      frame.setVisible(true)
+       */
 
       val (train, test) = create_train_test(ratings)
 
-      println("HERE")
-      println(train.toString())
+      val nFeatures = 10
+      val nIters = 10
 
-      // println("HERE")
-      // ratingsRDD.collect().foreach(println)
+      /*
+      We use ALS to decompose ratings into two matrices of size
+      U: features x users, M: features x movies
+      TO DO THIS:
+       * start with an M where the first row is the mean rating for that movie and the other values are random
+       * send M to each node, distribute ratings by rows and calculate in a distributed way the U that reduces the error (euclidean distance)
+       * collect U locally on each node
+       * repeat the operation, but with ratings distributed by columns
+       */
 
-      val features = 10
-      val n_iters = 10
+      val nItems = df
+        .select(countDistinct("item_id"))
+        .collect()(0)(0)
+        .asInstanceOf[Number]
+        .intValue()
 
-      // Ora dobbiamo usare ALS per decomporre ratings in due matrici di
-      // dimensione U: features x users, M: features x movies
-      // PER FARLO:
-      //  * partiamo con un M in cui la prima riga corrisponde alla media del
-      //    rating per quel film e gli altri valori sono random
-      //  * mandiamo M ad ogni nodo, distribuiamo ratings per righe e calcoliamo
-      //    in modo distribuito la U che riduce l'errore (distanza euclidea)
-      //  * collezioniamo U in locale su ogni nodo
-      //  * ripetiamo l'operazione, ma con ratings distribuito per colonne
-      
-      val first_M_array = new Array[Double](nItems * features)
-      train.entries.map(a => a.j -> (1, a.value))
-                      .foldByKey((0,0))((a, b) => (a._1 + b._1) -> (a._2 + b._2))
-                      .map(a => a._1 -> (a._2._2 / a._2._1))
-                      .collect().foreach {
-                        case (i1, v) => first_M_array(i1.toInt) = v
-                                        for (i2 <- 1 until features) {
-          // il paper qui dice "small random value", se si rompe in modo strano
-          // questo potrebbe essere il motivo
-                                          first_M_array(i1.toInt + i2.toInt) = Random.nextDouble()
-                                        }}
-      var M = new DenseMatrix(features, nItems, first_M_array)
-      var U = als_step(features, train, M)
-      val train_t = train.transpose()
-      for (iter <- 0 until n_iters) {
-        U = als_step(features, train, M)
-        M = als_step(features, train_t, U)
-        // calcolo errore:
-        val err = test.entries.map {
-          case MatrixEntry(i, j, v) => {
-            val Uval = U.values
-            val Mval = M.values
-            (for (fi <- 0 until features)
-              yield Uval(i.toInt * features + fi) 
-                    * Mval(j.toInt * features + fi))
-              .reduce(_+_)
+      // M0 is the M matrix at the first iteration
+      val M0 =
+        new Array[Double](
+          nItems * nFeatures
+        )
+
+      train.entries
+        .map(entry => entry.j -> (1, entry.value)) // (movie_id, (1, rating))
+        .foldByKey((0, 0))((movie1, movie2) =>
+          (movie1._1 + movie2._1) -> (movie1._2 + movie2._2) // (movie_id, (n_ratings, sum_ratings))
+        )
+        .map(movie =>
+          movie._1 -> (movie._2._2 / movie._2._1) // (movie_id, avg_rating)
+        )
+        .collect()
+        .foreach { case (movie_id, avg_rating) =>
+          M0(movie_id.toInt) = avg_rating
+          for (feature <- 1 until nFeatures) {
+            // the paper says "small random value", if it breaks in a weird way
+            // this could be the reason
+            M0(movie_id.toInt + feature.toInt) = Random.nextDouble()
           }
-        }.reduce(_+_)
+        }
+      var M = new DenseMatrix(nFeatures, nItems, M0)
+      var U = als_step(nFeatures, train, M)
+      val trainT = train.transpose()
+      for (iter <- 0 until nIters) {
+        U = als_step(nFeatures, train, M)
+        M = als_step(nFeatures, trainT, U)
+        // error calculation
+        val err = test.entries
+          .map {
+            case MatrixEntry(user_id, movie_id, _) => {
+              val Uvals = U.values
+              val Mvals = M.values
+              (for (feature <- 0 until nFeatures)
+                yield Uvals(user_id.toInt * nFeatures + feature)
+                  * Mvals(movie_id.toInt * nFeatures + feature))
+                .reduce(_ + _)
+            }
+          }
+          .reduce(_ + _)
         println(s"iter: $iter, error: $err")
       }
     }
