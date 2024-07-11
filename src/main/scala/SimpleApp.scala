@@ -284,7 +284,7 @@ package SimpleApp {
       val sparsity = 100 * (interactions / matrixSize)
 
       println(f"dimension: ${matrixSize}")
-      println(f"sparsity: $sparsity%.1f%%")
+      println(f"sparsity: ${sparsity}")
 
       /*
       // get non null entries for every user
@@ -336,11 +336,7 @@ package SimpleApp {
        * repeat the operation, but with ratings distributed by columns
        */
 
-      val nItems = df
-        .select(countDistinct("item_id"))
-        .collect()(0)(0)
-        .asInstanceOf[Number]
-        .intValue()
+      val nItems = ratings.numCols().toInt
 
       // M0 is the M matrix at the first iteration
       val M0 =
