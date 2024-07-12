@@ -124,12 +124,24 @@ package SimpleApp {
       var M = new DenseMatrix(nFeatures, nItems, M0)
       var U = als_step(nFeatures, train, M)
       val trainT = train.transpose()
+      // cached for precRecAtK
+      val thresh = 3.0
+      val testNotNull = test.toIndexedRowMatrix().rows.map(a =>
+          a.index.toInt -> a.vector.toArray.zipWithIndex.filter {
+            case (rating, _) => rating != 0
+          }.map { case (rating, index) => index -> (rating > thresh)}.toMap)
+
       for (iter <- 0 until nIters) {
         M = als_step(lambda, trainT, U)
         U = als_step(lambda, train, M)
         // error calculation
-        val err = rms(M, U, test)
-        println(s"iter: $iter, error: $err")
+        val rmsErr = rms(M, U, test)
+        println(s"iter: $iter, rms error: $rmsErr")
+        Array(3, 5, 8).map(k => {
+          val (prec, rec) = precRecAtK(thresh, k, M, U, test)
+          println(s"iter: $iter, thresh: $thresh, prec@$k: $prec")
+          println(s"iter: $iter, thresh: $thresh, rec@$k: $rec")
+        })
       }
     }
 
@@ -176,15 +188,11 @@ package SimpleApp {
           .count() == 0
       )
 
-      println("ratings:", ratings.numRows(), "x", ratings.numCols())
-      println("train:", train.numRows(), "x", train.numCols())
-      println("test:", test.numRows(), "x", test.numCols())
       assert(ratings.numCols() == train.numCols())
       assert(ratings.numCols() == test.numCols())
       assert(ratings.numRows() == train.numRows())
       assert(ratings.numRows() == test.numRows())
 
-      println("the asserts are true!")
       println("train entries: ", train.entries.count())
       println("test entries: ", test.entries.count())
 
@@ -388,27 +396,55 @@ package SimpleApp {
       }.reduce(_ + _) / R.entries.count())
     }
 
-//    TODO: da finire
-//    def precisionK(k: Integer, M: DenseMatrix, U: DenseMatrix, R: CoordinateMatrix) = {
-//      def getBestK[T <% Ordered[T]](a: Array[T]): Array[Int] = {
-//          a.zipWithIndex
-//            .sortWith((a, b) => a._1 > b._1).take(k).map {
-//            case (rating, index) => index
-//          }
-//      }
-//
-//      val features = M.numRows
-//      R.toIndexedRowMatrix().rows.map(a => {
-//        val index = a.index.toInt
-//        val row = a.vector
-//        val expectedBest = getBestK(row.toArray)
-//
-//        val userFeat = U.colIter.drop(index).next
-//        val suggestedBest =
-//            getBestK(M.colIter.map(a => a.dot(userFeat)).toArray)
-//
-//        expectedBest.apply
-//      })
-//    }
+    def precRecAtK(
+        thresh: Double, 
+        k: Integer,
+        M: DenseMatrix, 
+        U: DenseMatrix, 
+        R: CoordinateMatrix
+    ) = {
+      val features = M.numRows
+      val (prec, rec) = R.toIndexedRowMatrix().rows.map(a => {
+        val index = a.index.toInt
+        val row = a.vector.toArray
+
+        val notNullRowIndex = row.zipWithIndex.filter {
+            case (rating, _) => rating != 0
+          }.map { case (_, index) => index }
+
+        val userFeat = U.colIter.drop(index).next
+        val recRow = M.colIter
+          .map(a => a.dot(userFeat)).toArray
+          .zipWithIndex.filter {
+            case (_, index) => notNullRowIndex.contains(index)
+            }.map { case (rating, _) => rating }
+
+        val suggestedBest = recRow.zipWithIndex
+          .sortWith((a, b) => a._1 > b._1).filter {
+            case (rating, _) => rating >= thresh
+          }.take(k).map {
+            case (_, index) => index
+          }
+        val relevantRecomm = suggestedBest
+          .filter(index => row(notNullRowIndex(index)) >= thresh).length
+
+        val precK = if (suggestedBest.length > 0) {
+          relevantRecomm.toDouble / suggestedBest.length.toDouble
+        } else {
+          1.0
+        }
+
+        val allRelevant = row.filter(a => a >= thresh).length
+        val recK = if (allRelevant > 0) {
+          relevantRecomm.toDouble / allRelevant.toDouble
+        } else {
+          1.0
+        }
+
+        precK -> recK
+      }).fold((0,0))((a, b) => a._1 + b._1 -> (a._2 + b._2))
+
+      prec / R.numRows() -> (rec / R.numRows())
+    }
   }
 }
