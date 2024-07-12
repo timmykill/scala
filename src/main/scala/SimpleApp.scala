@@ -121,26 +121,36 @@ package SimpleApp {
               M0(movie_id.toInt + feature.toInt) = ranDouble - bigPart
             }
         }
+      val trainT = train.transpose()
+
+      def stamp() = {
+        System.currentTimeMillis / 1000
+      }
+      println(s"${stamp()} - start als")
       var M = new DenseMatrix(nFeatures, nItems, M0)
       var U = als_step(nFeatures, train, M)
-      val trainT = train.transpose()
-      // cached for precRecAtK
+      println(s"${stamp()} - done first half-iter")
+        
+      // for calc of prec@K and rec@K
       val thresh = 3.0
       val testNotNull = test.toIndexedRowMatrix().rows.map(a =>
-          a.index.toInt -> a.vector.toArray.zipWithIndex.filter {
+          a.index.toInt -> 
+          a.vector.toArray.zipWithIndex.filter {
             case (rating, _) => rating != 0
-          }.map { case (rating, index) => index -> (rating > thresh)}.toMap)
+          }.map { case (rating, index) => index -> (rating > thresh)}.toMap).take(50)
 
       for (iter <- 0 until nIters) {
-        M = als_step(lambda, trainT, U)
         U = als_step(lambda, train, M)
+        M = als_step(lambda, trainT, U)
+        println(s"${stamp()} - done iter: $iter")
         // error calculation
         val rmsErr = rms(M, U, test)
-        println(s"iter: $iter, rms error: $rmsErr")
+        println(s"${stamp()} - iter: $iter, rms error: $rmsErr")
+        val cachedK = cacheAtK(thresh, 8, M, U, testNotNull).toMap
         Array(3, 5, 8).map(k => {
-          val (prec, rec) = precRecAtK(thresh, k, M, U, test)
-          println(s"iter: $iter, thresh: $thresh, prec@$k: $prec")
-          println(s"iter: $iter, thresh: $thresh, rec@$k: $rec")
+          val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
+          println(s"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: $prec")
+          println(s"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: $rec")
         })
       }
     }
@@ -347,7 +357,7 @@ package SimpleApp {
                  )
        val (frame, _) = show(plot)
        frame.setVisible(true)
-       */
+      */
 
       // get non null entries for every user
       val notNullByUser = ratings
@@ -396,45 +406,53 @@ package SimpleApp {
       }.reduce(_ + _) / R.entries.count())
     }
 
-    def precRecAtK(
-        thresh: Double, 
-        k: Integer,
-        M: DenseMatrix, 
-        U: DenseMatrix, 
-        R: CoordinateMatrix
+    def cacheAtK (
+      thresh: Double,
+      maxK: Integer,
+      M: DenseMatrix,
+      U: DenseMatrix,
+      testCached: Array[(Int, Map[Int,Boolean])],
     ) = {
-      val features = M.numRows
-      val (prec, rec) = R.toIndexedRowMatrix().rows.map(a => {
-        val index = a.index.toInt
-        val row = a.vector.toArray
-
-        val notNullRowIndex = row.zipWithIndex.filter {
-            case (rating, _) => rating != 0
-          }.map { case (_, index) => index }
+      testCached.map(a => {
+        val index = a._1
+        val row = a._2
 
         val userFeat = U.colIter.drop(index).next
         val recRow = M.colIter
           .map(a => a.dot(userFeat)).toArray
           .zipWithIndex.filter {
-            case (_, index) => notNullRowIndex.contains(index)
-            }.map { case (rating, _) => rating }
+            case (_, index) => row.keySet.contains(index)
+            }
 
-        val suggestedBest = recRow.zipWithIndex
-          .sortWith((a, b) => a._1 > b._1).filter {
-            case (rating, _) => rating >= thresh
-          }.take(k).map {
-            case (_, index) => index
-          }
-        val relevantRecomm = suggestedBest
-          .filter(index => row(notNullRowIndex(index)) >= thresh).length
+        index -> recRow.filter {
+          case (rating, _) => rating >= thresh
+        }.sortWith((a, b) => a._1 > b._1).take(maxK).map {
+          case (_, index) => index
+        }
+      })
+    }
 
-        val precK = if (suggestedBest.length > 0) {
-          relevantRecomm.toDouble / suggestedBest.length.toDouble
+    def precRecAtK (
+        k: Integer,
+        testCached: Array[(Int, Map[Int,Boolean])],
+        suggestedCached: Map[Int, Array[Int]],
+        stopAt: Int
+    ) = {
+      val (prec, rec) = testCached.map(a => {
+        val index = a._1
+        val row = a._2
+        val suggestedForUser = suggestedCached(index).take(k)
+
+        val relevantRecomm = suggestedForUser
+          .filter(index => row(index)).length
+
+        val precK = if (suggestedForUser.length > 0) {
+          relevantRecomm.toDouble / suggestedForUser.length.toDouble
         } else {
           1.0
         }
 
-        val allRelevant = row.filter(a => a >= thresh).length
+        val allRelevant = row.filter(a => a._2).size
         val recK = if (allRelevant > 0) {
           relevantRecomm.toDouble / allRelevant.toDouble
         } else {
@@ -442,9 +460,10 @@ package SimpleApp {
         }
 
         precK -> recK
-      }).fold((0,0))((a, b) => a._1 + b._1 -> (a._2 + b._2))
+      }).reduce((a, b) => a._1 + b._1 -> (a._2 + b._2))
 
-      prec / R.numRows() -> (rec / R.numRows())
+      val counted = testCached.length
+      prec / counted -> (rec / counted)
     }
   }
 }
