@@ -17,6 +17,7 @@ import org.apache.spark.sql.types.{StructType, StructField, IntegerType,
 package SimpleApp {
 
   import org.apache.spark.mllib.linalg.distributed.IndexedRow
+  import scala.collection.immutable.NumericRange
   object SimpleApp {
     def main(args: Array[String]): Unit = {
       val spark = SparkSession
@@ -76,105 +77,110 @@ package SimpleApp {
 
       val (train, test) = create_train_test(ratings)
 
-      val nFeatures = 12
-      val lambda = 0.1
-      val nIters = 15
+      val nFeatures = 20
+      val lambda = 0.142
+      (100 to 500 by 10).map(nFeatures => {
+        val nIters = 15
+        println("nFeatures", nFeatures)
 
-      /*
-      We use ALS to decompose ratings into two matrices of size
-      U: features x users, M: features x movies
-      TO DO THIS:
-       * start with an M where the first row is the mean rating for that movie and the other values are random
-       * send M to each node, distribute ratings by rows and calculate in a distributed way the U that reduces the error (euclidean distance)
-       * collect U locally on each node
-       * repeat the operation, but with ratings distributed by columns
-      */
+        /*
+        We use ALS to decompose ratings into two matrices of size
+        U: features x users, M: features x movies
+        TO DO THIS:
+         * start with an M where the first row is the mean rating for that movie and the other values are random
+         * send M to each node, distribute ratings by rows and calculate in a distributed way the U that reduces the error (euclidean distance)
+         * collect U locally on each node
+         * repeat the operation, but with ratings distributed by columns
+        */
 
-      val nItems = ratings.numCols().toInt
-      val nUsers = ratings.numRows().toInt
+        val nItems = ratings.numCols().toInt
+        val nUsers = ratings.numRows().toInt
 
-      val averages = train.entries
-        .map {
-          case MatrixEntry(_, movie_id, rating) => movie_id -> (1, rating)
-        }.foldByKey((0, 0))((movie1, movie2) =>
-          (movie1._1 + movie2._1) -> (movie1._2 + movie2._2)
-          // (movie_id, (n_ratings, sum_ratings))
-        )
-        .map {
-          case (movie_id, (n_ratings, sum_ratings)) =>
-            movie_id.toInt -> (n_ratings / sum_ratings)
-        }.collect()
+        val averages = train.entries
+          .map {
+            case MatrixEntry(_, movie_id, rating) => movie_id -> (1, rating)
+          }.foldByKey((0, 0))((movie1, movie2) =>
+            (movie1._1 + movie2._1) -> (movie1._2 + movie2._2)
+            // (movie_id, (n_ratings, sum_ratings))
+          ).map {
+            case (movie_id, (n_ratings, sum_ratings)) =>
+              movie_id.toInt -> (n_ratings / sum_ratings)
+          }.collect()
 
-      // M0 is the M matrix at the first iteration
-      val M0 =
-        new Array[Double](
-          nItems * nFeatures
-        )
-        averages.foreach { case (movie_id, avg_rating) =>
-            M0(movie_id) = avg_rating
-            for (feature <- 1 until nFeatures) {
-              // the paper says "small random value", if it breaks in a weird
-              // way this could be the reason
-              val bigRate = 10
-              val ranDouble = Random.nextDouble()
-              val bigPart = ((ranDouble * bigRate).floor / bigRate)
-              M0(movie_id + feature.toInt) = ranDouble - bigPart
-            }
+        // M0 is the M matrix at the first iteration
+        val M0 =
+          new Array[Double](
+            nItems * nFeatures
+          )
+          averages.foreach { case (movie_id, avg_rating) =>
+              M0(movie_id) = avg_rating
+              for (feature <- 1 until nFeatures) {
+                // the paper says "small random value", if it breaks in a weird
+                // way this could be the reason
+                val bigRate = 10
+                val ranDouble = Random.nextDouble()
+                val bigPart = ((ranDouble * bigRate).floor / bigRate)
+                M0(movie_id + feature.toInt) = ranDouble - bigPart
+              }
+          }
+        val trainT = train.transpose()
+
+        def stamp() = {
+          System.currentTimeMillis / 1000
         }
-      val trainT = train.transpose()
 
-      def stamp() = {
-        System.currentTimeMillis / 1000
-      }
-
-      // for calc of prec@K and rec@K
-      val thresh = 3.0
-      // Array[(user_id, Map[movie_id, is_relevant])]
-      // we only sample the first N users, for performance
-      val sampled_users = 200
-      val ks = Array(1,3,5,8,10)
-      val testNotNull = test.toIndexedRowMatrix().rows.map(a =>
-          a.index.toInt -> 
-          a.vector.toArray.zipWithIndex.filter {
-            case (rating, _) => rating != 0
-          }.map {case (rating, index) => index -> (rating > thresh)}
-          .toMap).take(sampled_users)
-      
-      // prec@K, rec@K baseline: recommend based on average
-      val recommAverages = averages
-        .filter { case (index, rating) => rating > thresh}
-        .map { case (index, _) => index }
-      // TODO: qui per risparmiare memoria e cicli va creata una mappa finta
-      val avrgMap = (0 until nUsers)
-        .map(u => u -> recommAverages).toMap
-
-      ks.map(k => {
-        val (prec, rec) = precRecAtK(k, testNotNull, avrgMap, 100)
-        println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.3f")
-        println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.3f")
-      })
-
-      println(s"${stamp()} - start als")
-      var M = new DenseMatrix(nFeatures, nItems, M0)
-      var U = als_step(nFeatures, train, M)
-      println(s"${stamp()} - done first half-iter")
+        // for calc of prec@K and rec@K
+        val thresh = 2.5
+        // Array[(user_id, Map[movie_id, is_relevant])]
+        // we only sample the first N users, for performance
+        val sampled_users = 200
+        val ks = Array(1,3,5,8,10)
+        val testNotNull = test.toIndexedRowMatrix().rows.map(a =>
+            a.index.toInt -> 
+            a.vector.toArray.zipWithIndex.filter {
+              case (rating, _) => rating != 0
+            }.map {case (rating, index) => index -> (rating > thresh)}
+            .toMap).take(sampled_users)
         
+        // prec@K, rec@K baseline: recommend based on average
+        val recommAverages = averages
+          .filter { case (index, rating) => rating > thresh}
+          .map { case (index, _) => index }
+        // TODO: qui per risparmiare memoria e cicli va creata una mappa finta
+        val avrgMap = (0 until nUsers)
+          .map(u => u -> recommAverages).toMap
 
-      for (iter <- 0 until nIters) {
-        U = als_step(lambda, train, M)
-        M = als_step(lambda, trainT, U)
-        println(s"${stamp()} - done iter: $iter")
-        // error calculation
-        val rmsErr = rms(M, U, test)
-        println(s"${stamp()} - iter: $iter, rms error: $rmsErr")
-        // maxK film recommanded, per ogni utente
-        val cachedK = cacheAtK(thresh, 8, M, U, testNotNull).toMap
         ks.map(k => {
-          val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.3f")
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.3f")
+          val (prec, rec) = precRecAtK(k, testNotNull, avrgMap, 100)
+          println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.3f")
+          println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.3f")
         })
-      }
+
+        println(s"${stamp()} - start als")
+        var M = new DenseMatrix(nFeatures, nItems, M0)
+        var U = als_step(nFeatures, train, M)
+        println(s"${stamp()} - done first half-iter")
+          
+
+        for (iter <- 0 until nIters) {
+          U = als_step(lambda, train, M)
+          M = als_step(lambda, trainT, U)
+          println(s"${stamp()} - done iter: $iter")
+          // error calculation
+          val rmseTest = rms(M, U, test)
+          println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.3f")
+          val rmseTrain = rms(M, U, train)
+          println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.3f")
+          // maxK film recommanded, per ogni utente
+          val cachedK = cacheAtK(thresh, 8, M, U, testNotNull).toMap
+          ks.map(k => {
+            val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
+            println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.3f")
+            println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.3f")
+          })
+        }
+        println()
+      })
     }
 
     def create_train_test(ratings: CoordinateMatrix) = {
@@ -190,7 +196,7 @@ package SimpleApp {
             .map(indexedNonZeroRating =>
               indexedNonZeroRating._2 // keep only the indexes of the movies
             )
-          userId -> Random.shuffle(ratedMovies).take(10)
+          userId -> Random.shuffle(ratedMovies).take(15)
         })
         .collect()
         .toMap
