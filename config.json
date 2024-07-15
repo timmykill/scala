@@ -1,0 +1,6 @@
+{
+	"features": 8,
+	"lambda": 0.65,
+	"iters": 50,
+	"threshold": 3.2
+}

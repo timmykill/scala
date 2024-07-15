@@ -7,19 +7,29 @@ import org.apache.spark.mllib.linalg.{DenseVector, Matrices, DenseMatrix,
 import org.nspl._
 import org.nspl.awtrenderer._
 import scala.util.Random
-import scala.math.{pow, sqrt}
+import scala.math.{pow, sqrt, max}
 import java.awt.{Panel, Frame, Graphics}
 import javax.imageio.ImageIO
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.{StructType, StructField, IntegerType,
   DoubleType, LongType}
+import org.apache.spark.mllib.linalg.distributed.IndexedRow
+import scala.collection.immutable.NumericRange
+import org.apache.spark.mllib.linalg.SparseVector
+import org.apache.spark.SparkContext
+import scala.collection.mutable.ArraySeq
 
 package SimpleApp {
 
-  import org.apache.spark.mllib.linalg.distributed.IndexedRow
-  import scala.collection.immutable.NumericRange
+
   object SimpleApp {
+    def stamp() = {
+      System.currentTimeMillis / 1000
+    }
+
     def main(args: Array[String]): Unit = {
+      val config = upickle.default.read[Map[String, Double]](os.read(os.pwd / "config.json"))
+
       val spark = SparkSession
         .builder()
         .appName("Create Ratings Matrix")
@@ -28,44 +38,54 @@ package SimpleApp {
 
       spark.sparkContext.setLogLevel("ERROR")
 
-      // columns: user_id item_id rating timestamp
-      val customSchema = StructType(
-        Array(
-          StructField("user_id", IntegerType, true),
-          StructField("item_id", IntegerType, true),
-          StructField("rating", DoubleType, true),
-          StructField("timestamp", LongType, true)
-        )
-      )
-
-      // Read the CSV file into a DataFrame
-      val df = spark.read
-        .option("header", "true")
-        .schema(customSchema)
-        .option("delimiter", "\t")
-        .csv("ml-100k/u.data")
-
-      df.show()
-
-      // list of matrix entries needed to create the coordinate matrix
-      val entries = df.rdd.map(row => {
-        val userId = row.getAs[Int]("user_id")
-        val itemId = row.getAs[Int]("item_id")
-        val rating = row.getAs[Double]("rating")
-        MatrixEntry(userId - 1, itemId - 1, rating) // row, column, value
-      })
+      // Read files
+      println(s"${stamp()} - start reading file")
+      val ratingsByUser = (1 to 4)
+        .map(n => spark.sparkContext
+          .textFile(s"tabular_data_$n.txt")
+          .map(l => {
+            val splitted = l.split("\t")
+            assert(splitted.length == 3)
+            // movieIds are one indexed
+            val movieId = splitted(0).toInt - 1
+            val origUserId = splitted(1).toInt
+            val rating = splitted(2).toDouble
+            origUserId -> (Array(movieId), Array(rating))
+          }).reduceByKey((a, b) => (a._1 ++ b._1) -> (a._2 ++ b._2))
+        ).reduce((a, b) => a.join(b).map {
+          case(origUserId, ((movies1, ratings1), (movies2, ratings2))) =>
+              origUserId -> (movies1 ++ movies2, ratings1 ++ ratings2)
+        })
+      val maxMovieId = ratingsByUser.map {
+          case (_, (moviesId, _)) => moviesId.max
+        }.reduce(max(_,_))
+      println(s"${stamp()} - maxMovieId: ${maxMovieId}")
+      val uidConversionAndRows = ratingsByUser.map {
+              case (orig_user_id: Int, 
+                    (movie_ids: Array[Int],
+                     ratings: Array[Double])) =>
+                orig_user_id -> 
+                  new SparseVector(maxMovieId + 1, movie_ids, ratings)
+        }.zipWithIndex.map {
+          case ((userId, vector), index) => 
+            (userId, index) -> new IndexedRow(index, vector)
+        }
 
       // CoordinateMatrix is a distributed matrix which
       // uses COO as the underlying storage (which is, in practice, a list of 
       // matrix entries)
       // ideally sorted first by row, then by column
-      val ratings = new CoordinateMatrix(entries)
+      val uidConversion = uidConversionAndRows.map {case (a,b) => a}.collect().toMap
+      val ratings = new IndexedRowMatrix(
+        uidConversionAndRows.map {case (a,b) => b})
+      println(s"${stamp()} - created ratings matrix")
 
       val matrixSize: Double = ratings.numRows() * ratings.numCols()
       println(f"rows: ${ratings.numRows}")
       println(f"cols: ${ratings.numCols}")
 
-      val interactions = entries.count()
+      val interactions = ratings.rows
+        .map(a => a.vector.numNonzeros).reduce(_+_)
       println(f"interactions: ${interactions}")
       val sparsity = 100 * (interactions / matrixSize)
 
@@ -75,11 +95,13 @@ package SimpleApp {
       // questa funzione non va in scala 12
       // showNotNull(ratings)
 
-      val (train, test) = create_train_test(ratings)
+      val (train, test) = createTrainTest(ratings, 6)
+      // val train = ratings
+      // val test = readProbeDataset(spark.sparkContext, ratingsByUser, uidConversion)
 
-      val nFeatures = 500
-      val lambda = 0.142
-      val nIters = 15
+      val nFeatures = config("features").floor.toInt
+      val lambda = config("lambda")
+      val nIters = config("iters").floor.toInt
       println("nFeatures", nFeatures)
 
       /*
@@ -92,18 +114,18 @@ package SimpleApp {
        * repeat the operation, but with ratings distributed by columns
       */
 
-      val nItems = ratings.numCols().toInt
-      val nUsers = ratings.numRows().toInt
+      val nItems = train.numCols().toInt
+      val nUsers = train.numRows().toInt
 
-      val averages = train.entries
+      val averages = train.toCoordinateMatrix.entries
         .map {
           case MatrixEntry(_, movie_id, rating) => movie_id -> (1, rating)
         }.foldByKey((0, 0))((movie1, movie2) =>
           (movie1._1 + movie2._1) -> (movie1._2 + movie2._2)
           // (movie_id, (n_ratings, sum_ratings))
         ).map {
-          case (movie_id, (n_ratings, sum_ratings)) =>
-            movie_id.toInt -> (n_ratings / sum_ratings)
+          case (movieId, (nRatings, sumRatings)) =>
+            movieId.toInt -> (sumRatings / nRatings)
         }.collect()
 
       // M0 is the M matrix at the first iteration
@@ -122,37 +144,60 @@ package SimpleApp {
               M0(movie_id + feature.toInt) = ranDouble - bigPart
             }
         }
-      val trainT = train.transpose()
+        println(s"${stamp()} - starting transposed")
+        val trainT = train.toCoordinateMatrix().transpose().toIndexedRowMatrix()
+        println(s"${stamp()} - finished transposed")
 
-      def stamp() = {
-        System.currentTimeMillis / 1000
-      }
 
       // for calc of prec@K and rec@K
-      val thresh = 3.2
+      val thresh = config("threshold")
       // Array[(user_id, Map[movie_id, is_relevant])]
       // we only sample the first N users, for performance
+      // TODO: maybe we can increase this one
       val sampled_users = 200
       val ks = Array(1,3,5,8,10,12,15)
-      val testNotNull = test.toIndexedRowMatrix().rows.map(a =>
+      val testNotNull = test.toIndexedRowMatrix().rows.map(a => {
           a.index.toInt -> 
           a.vector.toArray.zipWithIndex.filter {
             case (rating, _) => rating != 0
           }.map {case (rating, index) => index -> (rating > thresh)}
-          .toMap).take(sampled_users)
+          .toMap}).take(sampled_users)
+      
+      // DISPLAY SOME BASELINES
+      // RMSE baseline
+      val avrgsAsMap = averages.toMap
+      def rmseBase(toWhat: CoordinateMatrix) = {
+        sqrt(toWhat.entries.map {
+          case MatrixEntry(_, movieId, rating) => 
+            // println(s"movie average: ${avrgsAsMap(movieId.toInt)}, real rating: ${rating}")
+            if (avrgsAsMap.contains(movieId.toInt)) {
+              pow(avrgsAsMap(movieId.toInt) - rating, 2)
+            } else {
+              println(s"whats the average rating of movieId: ${movieId}?")
+              pow(2.5 - rating, 2)
+            }
+        }.reduce(_+_) / test.entries.count())
+      }
+      println(f"${stamp()} - baseline, rms error to test set: ${rmseBase(test)}%.4f")
+      println(f"${stamp()} - baseline, rms error to train set: ${rmseBase(train.toCoordinateMatrix())}%.4f")
       
       // prec@K, rec@K baseline: recommend based on average
-      val recommAverages = averages
-        .filter { case (index, rating) => rating > thresh}
+      val reccOnAvgs = averages
+        .filter { case (index, rating) => rating > thresh }
         .map { case (index, _) => index }
-      // TODO: qui per risparmiare memoria e cicli va creata una mappa finta
+
+      // lot of memory wasted here,
+      // dont care till it explodes since its done once
+      val testNotNullAsMap = testNotNull.toMap
       val avrgMap = (0 until nUsers)
-        .map(u => u -> recommAverages).toMap
+        .map(u => u -> 
+          reccOnAvgs.filter(index => testNotNullAsMap.contains(u) && testNotNullAsMap(u).contains(index))
+        ).toMap
 
       ks.map(k => {
         val (prec, rec) = precRecAtK(k, testNotNull, avrgMap, 100)
-        println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.3f")
-        println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.3f")
+        println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.4f")
+        println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.4f")
       })
 
       println(s"${stamp()} - start als")
@@ -166,103 +211,51 @@ package SimpleApp {
         M = als_step(lambda, trainT, U)
         println(s"${stamp()} - done iter: $iter")
         // error calculation
-        val rmseTest = rms(M, U, test)
-        println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.3f")
-        val rmseTrain = rms(M, U, train)
-        println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.3f")
+        val rmseTest = rmse(M, U, test)
+        println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.4f")
+        val rmseTrain = rmse(M, U, train.toCoordinateMatrix())
+        println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
         // maxK film recommanded, per ogni utente
-        val cachedK = cacheAtK(thresh, 8, M, U, testNotNull).toMap
+        val cachedK = cacheAtK(thresh, ks.max, M, U, testNotNull).toMap
         ks.map(k => {
           val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.3f")
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.3f")
+          println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.4f")
+          println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.4f")
         })
       }
       println()
     }
 
-    def create_train_test(ratings: CoordinateMatrix) = {
-      val testIndexes = ratings
-        .toIndexedRowMatrix()
-        .rows
-        .map(user => {
-          val userId = user.index
-          val ratedMovies = user.vector.toArray.toList.zipWithIndex
-            .filter(indexedRating =>
-              indexedRating._1 != 0 // filter out the movies that have not been rated by the user
-            )
-            .map(indexedNonZeroRating =>
-              indexedNonZeroRating._2 // keep only the indexes of the movies
-            )
-          userId -> Random.shuffle(ratedMovies).take(15)
-        })
-        .collect()
-        .toMap
-
-      val train = new CoordinateMatrix(
-        ratings.entries
-          .filter(entry => !testIndexes(entry.i).contains(entry.j)),
-        ratings.numRows(),
-        ratings.numCols()
-      )
-
-      val test = new CoordinateMatrix(
-        ratings.entries
-          .filter(a => testIndexes(a.i).contains(a.j)),
-        ratings.numRows(),
-        ratings.numCols()
-      )
-
-      // assert that train and test are disjoint
-      assert(
-        train.entries
-          .map(trainEntry => (trainEntry.i, trainEntry.j))
-          .intersection(
-            test.entries
-              .map(testEntry => (testEntry.i, testEntry.j))
-          )
-          .count() == 0
-      )
-
-      assert(ratings.numCols() == train.numCols())
-      assert(ratings.numCols() == test.numCols())
-      assert(ratings.numRows() == train.numRows())
-      assert(ratings.numRows() == test.numRows())
-
-      println("train entries: ", train.entries.count())
-      println("test entries: ", test.entries.count())
-
-      train -> test
-    }
-
     def als_step(
         lambda: Double, // regularization parameter
-        ratings: CoordinateMatrix, // ratings matrix
+        ratings: IndexedRowMatrix, // ratings matrix
         from: DenseMatrix // fixed matrix
     ) = {
       val nFeatures = from.numRows
       val to_unordered = ratings
-        .toIndexedRowMatrix()
         .rows
         .map(user => {
           val userId = user.index
-          val userRatings = user.vector
+          val userRatings = user.vector.toSparse
 
-          // invariant: nonZeroMovies is sorted in ascending order
-          val indexedNonZeroMovies = userRatings.toArray.zipWithIndex.filter {
-            case (0, _) => false
-            case (_, _) => true
-          } // only keep the movies that have been rated
-          assert(indexedNonZeroMovies.length > 0)
+          //// invariant: nonZeroMovies is sorted in ascending order
+          //val indexedNonZeroMovies = userRatings.toArray.zipWithIndex.filter {
+          //  case (0, _) => false
+          //  case (_, _) => true
+          //} // only keep the movies that have been rated
+          //assert(indexedNonZeroMovies.length > 0)
 
-          val nonZeroMoviesIds =
-            indexedNonZeroMovies map { case (rating, index) =>
-              index
-            }
-          val nonZeroMoviesRatings =
-            indexedNonZeroMovies map { case (rating, index) =>
-              rating
-            }
+          //val nonZeroMoviesIds =
+          //  indexedNonZeroMovies map { case (rating, index) =>
+          //    index
+          //  }
+          //val nonZeroMoviesRatings =
+          //  indexedNonZeroMovies map { case (rating, index) =>
+          //    rating
+          //  }
+
+          val nonZeroMoviesIds = userRatings.indices
+          val nonZeroMoviesRatings = userRatings.values
 
           // assert che sia column major
           assert(!from.isTransposed)
@@ -282,6 +275,8 @@ package SimpleApp {
 
           // for each movie that the user has rated
           // copy the movie from the M matrix to the Mm matrix
+          assert(nonZeroMoviesIds.length != 0, s"why does user ${userId} have zero ratings?")
+
           var toMovieId = 0
           for (fromMovieId <- 0 to nonZeroMoviesIds.last) {
             if (fromMovieId == nonZeroMoviesIds(toMovieId)) {
@@ -296,14 +291,19 @@ package SimpleApp {
             }
           }
           // all non zero movies should be in the new matrix
-          assert(toMovieId == nonZeroMoviesIds.length)
+          assert(
+            toMovieId == nonZeroMoviesIds.length,
+            s"""current toMovieId is ${toMovieId}, 
+              nonZeroMovies is 
+              ${nonZeroMoviesIds.map(a => a.toString()).reduce(_ ++ "," ++ _)}"""
+          )
           val Mm =
             new DenseMatrix(nFeatures, nonZeroMoviesIds.length, Mm_array)
 
           val tmp = Mm.multiply(Mm.transpose).values // Mm * Mm^T
           for (i <- 0 until nFeatures) {
             val j = i + (nFeatures * i)
-            tmp(j) = tmp(j) + lambda * indexedNonZeroMovies.length.toDouble
+            tmp(j) = tmp(j) + lambda * userRatings.numActives
           }
 
           val V = Mm.multiply(new DenseVector(nonZeroMoviesRatings)).toArray
@@ -371,6 +371,88 @@ package SimpleApp {
       ret
     }
 
+    def createTrainTest(ratings: IndexedRowMatrix, nTest: Int) = {
+      println("total entries: ", ratings
+        .rows.map(a => a.vector.numActives).reduce(_+_))
+
+      val splitted = ratings.rows.map {
+        case IndexedRow(userId, row) => {
+          val sparseRow = row.toSparse
+          val actives = sparseRow.numActives
+          val newNTest = if (actives <= nTest) {
+            //println(s"user $userId has $actives ratings, cant take $nTest for testing")
+            actives - 1
+          } else {
+            nTest
+          }
+          val nTrain = actives - newNTest
+          assert(nTrain > 0)
+          // wtf is wrong with you scala?
+          val negro = (sparseRow.indices zip sparseRow.values).toList
+          val shuffledRow = Random.shuffle(negro).toArray
+          val trainRow = shuffledRow.take(nTrain).sortWith((t1, t2) => t1._1 < t2._1)
+          val testRow = shuffledRow.takeRight(newNTest).sortWith((t1, t2) => t1._1 < t2._1)
+          new IndexedRow(
+            userId, 
+            new SparseVector(
+              row.size,
+              trainRow.map(_._1),
+              trainRow.map(_._2),
+            )) -> (
+              testRow.map {
+                case (movieId, rating) =>
+                  new MatrixEntry(userId.toLong, movieId.toLong, rating)
+            })
+        }
+      }
+      val train = new IndexedRowMatrix(splitted.map(_._1))
+      val test = new CoordinateMatrix(
+        splitted.map(_._2).flatMap(a => a))
+
+      assert(ratings.numCols() == train.numCols())
+      assert(ratings.numCols() == test.numCols())
+      assert(ratings.numRows() == train.numRows())
+      assert(ratings.numRows() == test.numRows())
+
+      println("train entries: ", train
+        .rows.map(a => a.vector.numActives).reduce(_+_))
+      println("test entries: ", test.entries.count())
+
+      train -> test
+    }
+
+    def readProbeDataset(
+      sc: SparkContext, 
+      fullDatasetByUser: RDD[(Int, (Array[Int], Array[Double]))],
+      uidConversion: Map[Int, Long]
+    ) = {
+      val testFileParsed = sc.textFile("tabular_probe.txt")
+          .map(l => {
+            val splitted = l.split("\t")
+            assert(splitted.length == 2)
+            // movieIds are one indexed
+            val movie_id = splitted(0).toInt - 1
+            val orig_user_id = splitted(1).toInt
+            orig_user_id -> movie_id
+          })
+
+      val testEntries = testFileParsed.join(fullDatasetByUser)
+        .map { case (origUserId, (testMovieId, (movieIds, ratings))) => {
+          val tmp = movieIds.indexOf(testMovieId)
+          if (tmp == -1) {
+            movieIds.foreach(a => println(origUserId, testMovieId, a))
+          }
+
+          new MatrixEntry(
+            uidConversion(origUserId), 
+            testMovieId.toLong,
+            ratings(movieIds.indexOf(testMovieId))
+          )
+        }}
+            
+      new CoordinateMatrix(testEntries)
+    }
+
     /* 
     def showNotNull(ratings: CoordinateMatrix) = {
       /*
@@ -416,7 +498,7 @@ package SimpleApp {
         frame.setVisible(true)
     }
     */
-    def rms(M: DenseMatrix, U: DenseMatrix, R: CoordinateMatrix) = {
+    def rmse(M: DenseMatrix, U: DenseMatrix, R: CoordinateMatrix) = {
       val nFeatures = M.numRows
       val Uvals = U.values
       val Mvals = M.values
@@ -464,13 +546,13 @@ package SimpleApp {
         suggestedCached: Map[Int, Array[Int]],
         stopAt: Int
     ) = {
-      val (prec, rec) = testCached.map { case (index, row) => {
+      val (prec, rec) = testCached.map { case (userId, movies) => {
         // k is possibly bigger than the number of recommanded movies
-        val suggestedForUser = suggestedCached(index).take(k)
+        val suggestedForUser = suggestedCached(userId).take(k)
 
         // relevantRecomm are the movies suggested and actually relevant
         val relevantRecomm = suggestedForUser
-          .filter(index => row(index)).length
+          .filter(index => movies(index)).length
 
         val precK = if (suggestedForUser.length > 0) {
           relevantRecomm.toDouble / suggestedForUser.length.toDouble
@@ -478,7 +560,7 @@ package SimpleApp {
           1.0
         }
 
-        val allRelevant = row.filter(a => a._2).size
+        val allRelevant = movies.filter(a => a._2).size
         val recK = if (allRelevant > 0) {
           relevantRecomm.toDouble / allRelevant.toDouble
         } else {
@@ -491,4 +573,5 @@ package SimpleApp {
       prec / counted -> (rec / counted)
     }
   }
+
 }

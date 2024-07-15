@@ -27,6 +27,8 @@ version := "1.0"
 
 libraryDependencies += "org.apache.spark" %% "spark-sql" % "3.5.0" % "provided"
 libraryDependencies += "org.apache.spark" %% "spark-mllib" % "3.5.0" % "provided"
+libraryDependencies += "com.lihaoyi" %% "upickle" % "3.3.1"
+libraryDependencies += "com.lihaoyi" %% "os-lib" % "0.10.2"
 libraryDependencies += "io.github.pityka" %% "nspl-awt" % "0.5.0"
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.19" % "test"
 
