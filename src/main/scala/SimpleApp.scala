@@ -92,12 +92,15 @@ package SimpleApp {
       println(f"dimension: ${matrixSize}")
       println(f"sparsity: ${sparsity}%.1f%%")
 
-      // questa funzione non va in scala 12
+      // questa funzione non va in scala 2.12
       // showNotNull(ratings)
 
-      val (train, test) = createTrainTest(ratings, 6)
-      // val train = ratings
-      // val test = readProbeDataset(spark.sparkContext, ratingsByUser, uidConversion)
+      val trainSplit = config("trainSplit").floor.toInt
+      val (train, test) = if (trainSplit > 0) {
+        createTrainTest(ratings, trainSplit)
+      } else {
+        ratings -> readProbeDataset(spark.sparkContext, ratingsByUser, uidConversion)
+      }
 
       val nFeatures = config("features").floor.toInt
       val lambda = config("lambda")
