@@ -28,7 +28,7 @@ package SimpleApp {
     }
 
     def main(args: Array[String]): Unit = {
-      val config = upickle.default.read[Map[String, Double]](os.read(os.pwd / "config.json"))
+      val config : Map[String, Double] = upickle.default.read[Map[String, Double]](os.read(os.pwd / "config.json"))
 
       val spark = SparkSession
         .builder()
@@ -71,41 +71,42 @@ package SimpleApp {
             (userId, index) -> new IndexedRow(index, vector)
         }
 
-      // CoordinateMatrix is a distributed matrix which
-      // uses COO as the underlying storage (which is, in practice, a list of 
-      // matrix entries)
-      // ideally sorted first by row, then by column
       val uidConversion = uidConversionAndRows.map {case (a,b) => a}.collect().toMap
       val ratings = new IndexedRowMatrix(
         uidConversionAndRows.map {case (a,b) => b})
       println(s"${stamp()} - created ratings matrix")
 
-      val matrixSize: Double = ratings.numRows() * ratings.numCols()
-      println(f"rows: ${ratings.numRows}")
-      println(f"cols: ${ratings.numCols}")
+      val matrixSize = ratings.numRows() * ratings.numCols()
+      println(f"${stamp()} - rows: ${ratings.numRows}")
+      println(f"${stamp()} - cols: ${ratings.numCols}")
 
       val interactions = ratings.rows
         .map(a => a.vector.numNonzeros).reduce(_+_)
-      println(f"interactions: ${interactions}")
-      val sparsity = 100 * (interactions / matrixSize)
+      println(f"${stamp()} - interactions: ${interactions}")
+      val sparsity = 100 * (interactions.toDouble / matrixSize.toDouble)
 
-      println(f"dimension: ${matrixSize}")
-      println(f"sparsity: ${sparsity}%.1f%%")
+      println(f"${stamp()} - dimension: ${matrixSize}")
+      println(f"${stamp()} - sparsity: ${sparsity}%.1f%%")
 
       // questa funzione non va in scala 2.12
       // showNotNull(ratings)
 
+      println(s"${stamp()} - start train split")
       val trainSplit = config("trainSplit").floor.toInt
       val (train, test) = if (trainSplit > 0) {
-        createTrainTest(ratings, trainSplit)
-      } else {
-        ratings -> readProbeDataset(spark.sparkContext, ratingsByUser, uidConversion)
-      }
+          createTrainTest(ratings, trainSplit)
+        } else {
+          ratings -> readProbeDataset(
+            spark.sparkContext, 
+            ratingsByUser, 
+            uidConversion
+          )
+        }
 
       val nFeatures = config("features").floor.toInt
       val lambda = config("lambda")
       val nIters = config("iters").floor.toInt
-      println("nFeatures", nFeatures)
+      println(s"${stamp()} - nFeatures: $nFeatures")
 
       /*
       We use ALS to decompose ratings into two matrices of size
@@ -120,6 +121,7 @@ package SimpleApp {
       val nItems = train.numCols().toInt
       val nUsers = train.numRows().toInt
 
+      println(s"${stamp()} - start calc averages")
       val averages = train.toCoordinateMatrix.entries
         .map {
           case MatrixEntry(_, movie_id, rating) => movie_id -> (1, rating)
@@ -132,6 +134,7 @@ package SimpleApp {
         }.collect()
 
       // M0 is the M matrix at the first iteration
+      println(s"${stamp()} - start create M0")
       val M0 =
         new Array[Double](
           nItems * nFeatures
@@ -141,30 +144,34 @@ package SimpleApp {
             for (feature <- 1 until nFeatures) {
               // the paper says "small random value", if it breaks in a weird
               // way this could be the reason
-              val bigRate = 10
+              val bigRate = config("bigRate")
               val ranDouble = Random.nextDouble()
               val bigPart = ((ranDouble * bigRate).floor / bigRate)
               M0(movie_id + feature.toInt) = ranDouble - bigPart
             }
         }
-        println(s"${stamp()} - starting transposed")
-        val trainT = train.toCoordinateMatrix().transpose().toIndexedRowMatrix()
-        println(s"${stamp()} - finished transposed")
+      val trainT = train.toCoordinateMatrix().transpose().toIndexedRowMatrix()
 
 
-      // for calc of prec@K and rec@K
+      // FOR CALC OF PREC@K AND REC@K
       val thresh = config("threshold")
+
       // Array[(user_id, Map[movie_id, is_relevant])]
       // we only sample the first N users, for performance
       // TODO: maybe we can increase this one
-      val sampled_users = 200
-      val ks = Array(1,3,5,8,10,12,15)
-      val testNotNull = test.toIndexedRowMatrix().rows.map(a => {
-          a.index.toInt -> 
-          a.vector.toArray.zipWithIndex.filter {
-            case (rating, _) => rating != 0
-          }.map {case (rating, index) => index -> (rating > thresh)}
-          .toMap}).take(sampled_users)
+      val precRecallData = if (thresh > 0) {
+          val sampledUsers = config("sampledUsersPrecRecall").floor.toInt
+          val ks = Array(1,3,5,8,10,12,15)
+          val testNotNull = test.toIndexedRowMatrix().rows.map(a => {
+              a.index.toInt -> 
+              a.vector.toArray.zipWithIndex.filter {
+                case (rating, _) => rating != 0
+              }.map {case (rating, index) => index -> (rating > thresh)}
+              .toMap}).take(sampledUsers)
+          Option(ks, testNotNull)
+        } else {
+          Option.empty
+        }
       
       // DISPLAY SOME BASELINES
       // RMSE baseline
@@ -182,26 +189,33 @@ package SimpleApp {
         }.reduce(_+_) / test.entries.count())
       }
       println(f"${stamp()} - baseline, rms error to test set: ${rmseBase(test)}%.4f")
-      println(f"${stamp()} - baseline, rms error to train set: ${rmseBase(train.toCoordinateMatrix())}%.4f")
+      val doRmseTrain = config("doRmseTrain") == 1.0
+      if (doRmseTrain) {
+        println(f"${stamp()} - baseline, rms error to train set: ${rmseBase(train.toCoordinateMatrix())}%.4f")
+      }
       
-      // prec@K, rec@K baseline: recommend based on average
-      val reccOnAvgs = averages
-        .filter { case (index, rating) => rating > thresh }
-        .map { case (index, _) => index }
+      // PREC@K, REC@K BASELINE: RECOMMEND BASED ON AVERAGE
+      precRecallData.foreach {
+        case (ks, testNotNull) => {
+          val reccOnAvgs = averages
+            .filter { case (index, rating) => rating > thresh }
+            .map { case (index, _) => index }
 
-      // lot of memory wasted here,
-      // dont care till it explodes since its done once
-      val testNotNullAsMap = testNotNull.toMap
-      val avrgMap = (0 until nUsers)
-        .map(u => u -> 
-          reccOnAvgs.filter(index => testNotNullAsMap.contains(u) && testNotNullAsMap(u).contains(index))
-        ).toMap
+          // lot of memory wasted here,
+          // dont care till it explodes since its done once
+          val testNotNullAsMap = testNotNull.toMap
+          val avrgMap = (0 until nUsers)
+            .map(u => u -> 
+              reccOnAvgs.filter(index => testNotNullAsMap.contains(u) && testNotNullAsMap(u).contains(index))
+            ).toMap
 
-      ks.map(k => {
-        val (prec, rec) = precRecAtK(k, testNotNull, avrgMap, 100)
-        println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.4f")
-        println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.4f")
-      })
+          ks.map(k => {
+            val (prec, rec) = precRecAtK(k, testNotNull, avrgMap, 100)
+            println(f"${stamp()} - baseline, thresh: $thresh, prec@$k: ${prec}%.4f")
+            println(f"${stamp()} - baseline, thresh: $thresh, rec@$k: ${rec}%.4f")
+          })
+        }
+      }
 
       println(s"${stamp()} - start als")
       var M = new DenseMatrix(nFeatures, nItems, M0)
@@ -216,15 +230,20 @@ package SimpleApp {
         // error calculation
         val rmseTest = rmse(M, U, test)
         println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.4f")
-        val rmseTrain = rmse(M, U, train.toCoordinateMatrix())
-        println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
-        // maxK film recommanded, per ogni utente
-        val cachedK = cacheAtK(thresh, ks.max, M, U, testNotNull).toMap
-        ks.map(k => {
-          val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.4f")
-          println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.4f")
-        })
+        if (doRmseTrain) {
+          val rmseTrain = rmse(M, U, train.toCoordinateMatrix())
+          println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
+        }
+        precRecallData.foreach {
+          case (ks, testNotNull) => {
+            val cachedK = cacheAtK(thresh, ks.max, M, U, testNotNull).toMap
+            ks.foreach(k => {
+              val (prec, rec) = precRecAtK(k, testNotNull, cachedK, 100)
+              println(f"${stamp()} - iter: $iter, thresh: $thresh, prec@$k: ${prec}%.4f")
+              println(f"${stamp()} - iter: $iter, thresh: $thresh, rec@$k: ${rec}%.4f")
+            })
+          }
+        }
       }
       println()
     }

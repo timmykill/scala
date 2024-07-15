@@ -3,5 +3,8 @@
 	"lambda": 0.065,
 	"iters": 15,
 	"threshold": 3.2,
-	"trainSplit": 20
+	"sampledUsersPrecRecall": 200,
+	"trainSplit": 20,
+	"bigRate": 10,
+	"doRmseTrain": 1.0
 }
