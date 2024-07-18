@@ -104,7 +104,6 @@ package SimpleApp {
         }
 
       val nFeatures = config("features").floor.toInt
-      val lambda = config("lambda")
       val nIters = config("iters").floor.toInt
       println(s"${stamp()} - nFeatures: $nFeatures")
 
@@ -221,18 +220,22 @@ package SimpleApp {
       var M = new DenseMatrix(nFeatures, nItems, M0)
       var U = als_step(nFeatures, train, M)
       println(s"${stamp()} - done first half-iter")
-        
 
-      for (iter <- 0 until nIters) {
+      val lambda = config("lambda")
+
+      (0 until nIters).map(iter => {
         U = als_step(lambda, train, M)
         M = als_step(lambda, trainT, U)
         println(s"${stamp()} - done iter: $iter")
         // error calculation
         val rmseTest = rmse(M, U, test)
         println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.4f")
-        if (doRmseTrain) {
+        val rmseTrain = if (doRmseTrain) {
           val rmseTrain = rmse(M, U, train.toCoordinateMatrix())
           println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
+          rmseTrain
+        } else {
+          0.0
         }
         precRecallData.foreach {
           case (ks, testNotNull) => {
@@ -244,14 +247,14 @@ package SimpleApp {
             })
           }
         }
-      }
-      println()
+        println()
+      })
     }
 
     def als_step(
-        lambda: Double, // regularization parameter
+        lambda: Double,            // regularization parameter
         ratings: IndexedRowMatrix, // ratings matrix
-        from: DenseMatrix // fixed matrix
+        from: DenseMatrix          // fixed matrix
     ) = {
       val nFeatures = from.numRows
       val to_unordered = ratings
