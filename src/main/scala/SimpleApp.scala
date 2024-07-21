@@ -28,12 +28,12 @@ package SimpleApp {
     }
 
     def main(args: Array[String]): Unit = {
-      val config : Map[String, Double] = upickle.default.read[Map[String, Double]](os.read(os.pwd / "config.json"))
+      val config : Map[String, Double] = upickle.default.read[Map[String, Double]](os.read(os.root / "tmp" / "config.json"))
 
       val spark = SparkSession
         .builder()
         .appName("Create Ratings Matrix")
-        .config("spark.master", "local[*]")
+        .config("spark.master", "yarn")
         .getOrCreate()
 
       spark.sparkContext.setLogLevel("ERROR")
@@ -51,11 +51,14 @@ package SimpleApp {
             val origUserId = splitted(1).toInt
             val rating = splitted(2).toDouble
             origUserId -> (Array(movieId), Array(rating))
-          }).reduceByKey((a, b) => (a._1 ++ b._1) -> (a._2 ++ b._2))
-        ).reduce((a, b) => a.join(b).map {
-          case(origUserId, ((movies1, ratings1), (movies2, ratings2))) =>
-              origUserId -> (movies1 ++ movies2, ratings1 ++ ratings2)
-        })
+        })).reduce((a,b) => a.union(b))
+        .reduceByKey((a, b) => (a._1 ++ b._1) -> (a._2 ++ b._2))
+        .map { case (uId, ratings) => {
+          val ratingsZipped = ratings._1.zip(ratings._2)
+          val sortedRatings = ratingsZipped.sortWith(_._1 < _._1)
+          uId -> sortedRatings.unzip
+        }}
+
       val maxMovieId = ratingsByUser.map {
           case (_, (moviesId, _)) => moviesId.max
         }.reduce(max(_,_))
@@ -102,6 +105,8 @@ package SimpleApp {
             uidConversion
           )
         }
+      train.rows.cache()
+      test.entries.cache()
 
       val nFeatures = config("features").floor.toInt
       val nIters = config("iters").floor.toInt
@@ -424,8 +429,8 @@ package SimpleApp {
           val nTrain = actives - newNTest
           assert(nTrain > 0)
           // wtf is wrong with you scala?
-          val negro = (sparseRow.indices zip sparseRow.values).toList
-          val shuffledRow = Random.shuffle(negro).toArray
+          val tmp = (sparseRow.indices zip sparseRow.values).toList
+          val shuffledRow = Random.shuffle(tmp).toArray
           val trainRow = shuffledRow.take(nTrain).sortWith((t1, t2) => t1._1 < t2._1)
           val testRow = shuffledRow.takeRight(newNTest).sortWith((t1, t2) => t1._1 < t2._1)
           new IndexedRow(
