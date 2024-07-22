@@ -1,0 +1,11 @@
+{
+	"features": 8,
+	"lambda": 0.032,
+	"iters": 25,
+	"threshold": 3.6,
+	"sampledUsersPrecRecall": 1000,
+	"trainSplit": 0,
+	"bigRate": 10,
+	"doRmseTrain": 0.0
+}
+
