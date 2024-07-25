@@ -28,12 +28,12 @@ package SimpleApp {
     }
 
     def main(args: Array[String]): Unit = {
-      val config : Map[String, Double] = upickle.default.read[Map[String, Double]](os.read(os.pwd / "config.json"))
+      val config : Map[String, Double] = upickle.default.read[Map[String, Double]](os.read(os.root / "tmp" / "config.json"))
 
       val spark = SparkSession
         .builder()
         .appName("Create Ratings Matrix")
-        .config("spark.master", "local[*]")
+        .config("spark.master", "yarn")
         .getOrCreate()
 
       spark.sparkContext.setLogLevel("ERROR")
@@ -51,11 +51,14 @@ package SimpleApp {
             val origUserId = splitted(1).toInt
             val rating = splitted(2).toDouble
             origUserId -> (Array(movieId), Array(rating))
-          }).reduceByKey((a, b) => (a._1 ++ b._1) -> (a._2 ++ b._2))
-        ).reduce((a, b) => a.join(b).map {
-          case(origUserId, ((movies1, ratings1), (movies2, ratings2))) =>
-              origUserId -> (movies1 ++ movies2, ratings1 ++ ratings2)
-        })
+        })).reduce((a,b) => a.union(b))
+        .reduceByKey((a, b) => (a._1 ++ b._1) -> (a._2 ++ b._2))
+        .map { case (uId, ratings) => {
+          val ratingsZipped = ratings._1.zip(ratings._2)
+          val sortedRatings = ratingsZipped.sortWith(_._1 < _._1)
+          uId -> sortedRatings.unzip
+        }}
+
       val maxMovieId = ratingsByUser.map {
           case (_, (moviesId, _)) => moviesId.max
         }.reduce(max(_,_))
@@ -102,6 +105,8 @@ package SimpleApp {
             uidConversion
           )
         }
+      train.rows.cache()
+      test.entries.cache()
 
       val nFeatures = config("features").floor.toInt
       val nIters = config("iters").floor.toInt
@@ -150,6 +155,7 @@ package SimpleApp {
             }
         }
       val trainT = train.toCoordinateMatrix().transpose().toIndexedRowMatrix()
+      trainT.rows.cache()
 
 
       // FOR CALC OF PREC@K AND REC@K
@@ -171,11 +177,13 @@ package SimpleApp {
         } else {
           Option.empty
         }
+
+      val testEntriesCount = test.entries.count().toDouble
       
       // DISPLAY SOME BASELINES
       // RMSE baseline
       val avrgsAsMap = averages.toMap
-      def rmseBase(toWhat: CoordinateMatrix) = {
+      def rmseBase(toWhat: CoordinateMatrix, toWhatSize: Double) = {
         sqrt(toWhat.entries.map {
           case MatrixEntry(_, movieId, rating) => 
             // println(s"movie average: ${avrgsAsMap(movieId.toInt)}, real rating: ${rating}")
@@ -185,12 +193,19 @@ package SimpleApp {
               println(s"whats the average rating of movieId: ${movieId}?")
               pow(2.5 - rating, 2)
             }
-        }.reduce(_+_) / test.entries.count())
+        }.reduce(_+_) / toWhatSize)
       }
-      println(f"${stamp()} - baseline, rms error to test set: ${rmseBase(test)}%.4f")
-      val doRmseTrain = config("doRmseTrain") == 1.0
-      if (doRmseTrain) {
-        println(f"${stamp()} - baseline, rms error to train set: ${rmseBase(train.toCoordinateMatrix())}%.4f")
+      println(f"${stamp()} - baseline, rms error to test set: ${rmseBase(test, testEntriesCount)}%.4f")
+      val rmseTrainData = if (config("doRmseTrain") == 1.0) {
+        val trainAsCoord = train.toCoordinateMatrix()
+        Option(trainAsCoord, trainAsCoord.entries.count())
+      } else {
+        Option.empty
+      }
+      rmseTrainData.foreach {
+        case (trainCoord, trainCoordCount) => {
+          println(f"${stamp()} - baseline, rms error to train set: ${rmseBase(trainCoord, trainCoordCount)}%.4f")
+        }
       }
       
       // PREC@K, REC@K BASELINE: RECOMMEND BASED ON AVERAGE
@@ -228,14 +243,16 @@ package SimpleApp {
         M = als_step(lambda, trainT, U)
         println(s"${stamp()} - done iter: $iter")
         // error calculation
-        val rmseTest = rmse(M, U, test)
+        // this could be done in parallel, if we didnt user mutable M, U
+        // would save ~5s per iteration
+        val rmseTest = rmse(M, U, test, testEntriesCount)
         println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to test set: $rmseTest%.4f")
-        val rmseTrain = if (doRmseTrain) {
-          val rmseTrain = rmse(M, U, train.toCoordinateMatrix())
-          println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
-          rmseTrain
-        } else {
-          0.0
+
+        rmseTrainData.foreach {
+          case (trainCoord, trainCoordCount) => {
+            val rmseTrain = rmse(M, U, trainCoord, trainCoordCount)
+            println(f"${stamp()} - lambda: $lambda, iter: $iter, rms error to train set: $rmseTrain%.4f")
+          }
         }
         precRecallData.foreach {
           case (ks, testNotNull) => {
@@ -334,8 +351,7 @@ package SimpleApp {
           val V = Mm.multiply(new DenseVector(nonZeroMoviesRatings)).toArray
           userId -> gauss_method(nFeatures, tmp, V)
           // }).sortByKey().map {case(i,v) => v}.reduce(_++_)
-        })
-        .collect()
+        }).collect()
 
       val ret_array = new Array[Double](ratings.numRows().toInt * nFeatures)
       // in questo ciclo faccio due operazioni:
@@ -413,8 +429,8 @@ package SimpleApp {
           val nTrain = actives - newNTest
           assert(nTrain > 0)
           // wtf is wrong with you scala?
-          val negro = (sparseRow.indices zip sparseRow.values).toList
-          val shuffledRow = Random.shuffle(negro).toArray
+          val tmp = (sparseRow.indices zip sparseRow.values).toList
+          val shuffledRow = Random.shuffle(tmp).toArray
           val trainRow = shuffledRow.take(nTrain).sortWith((t1, t2) => t1._1 < t2._1)
           val testRow = shuffledRow.takeRight(newNTest).sortWith((t1, t2) => t1._1 < t2._1)
           new IndexedRow(
@@ -523,7 +539,12 @@ package SimpleApp {
         frame.setVisible(true)
     }
     */
-    def rmse(M: DenseMatrix, U: DenseMatrix, R: CoordinateMatrix) = {
+    def rmse(
+      M: DenseMatrix,
+      U: DenseMatrix,
+      R: CoordinateMatrix,
+      Rcount: Double
+    ) = {
       val nFeatures = M.numRows
       val Uvals = U.values
       val Mvals = M.values
@@ -536,7 +557,7 @@ package SimpleApp {
           ).reduce(_ + _)
           pow(expected - rating, 2)
         }
-      }.reduce(_ + _) / R.entries.count())
+      }.reduce(_ + _) / Rcount)
     }
 
     def cacheAtK (
