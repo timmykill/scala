@@ -313,7 +313,7 @@ package SimpleApp {
             Mm is this submatrix
            */
           val Mm_array =
-            new Array[Double](nonZeroMoviesIds.length * nFeatures)
+            new Array[Double](nonZeroMoviesIds.length * nFeatures) // we remove the zero ratings because in the derivative formula they are not needed and we don't want to count them as actual values
 
           // for each movie that the user has rated
           // copy the movie from the M matrix to the Mm matrix
@@ -321,8 +321,8 @@ package SimpleApp {
 
           var toMovieId = 0
           for (fromMovieId <- 0 to nonZeroMoviesIds.last) {
-            if (fromMovieId == nonZeroMoviesIds(toMovieId)) {
-              Array.copy(
+            if (fromMovieId == nonZeroMoviesIds(toMovieId)) { // POST: actually a foreach
+              Array.copy( // we build the submatrix of movies that the user has rated
                 from.values,
                 fromMovieId * nFeatures,
                 Mm_array,
@@ -345,11 +345,11 @@ package SimpleApp {
           val tmp = Mm.multiply(Mm.transpose).values // Mm * Mm^T
           for (i <- 0 until nFeatures) {
             val j = i + (nFeatures * i)
-            tmp(j) = tmp(j) + lambda * userRatings.numActives
+            tmp(j) = tmp(j) + lambda * userRatings.numActives // n_(u i) * lambda
           }
 
           val V = Mm.multiply(new DenseVector(nonZeroMoviesRatings)).toArray
-          userId -> gauss_method(nFeatures, tmp, V)
+          userId -> gauss_method(nFeatures, tmp, V) // instead of calculating the inverse we use gauss (thx gauss)
           // }).sortByKey().map {case(i,v) => v}.reduce(_++_)
         }).collect()
 
@@ -359,7 +359,7 @@ package SimpleApp {
       //  * riempio con zeri le colonne degli utenti di cui non so nulla.
       //    Per fare una cosa fatta bene servirebbe una cold-start strategy,
       //    ma sinceramente non mi interessa
-      for (i <- 0 until to_unordered.length) {
+      for (i <- 0 until to_unordered.length) { // we need the same ordering as in the rating matrix, but the collect doesn't give us the same order. we save the user index, so we can order for that
         Array.copy(
           to_unordered(i)._2,
           0,
